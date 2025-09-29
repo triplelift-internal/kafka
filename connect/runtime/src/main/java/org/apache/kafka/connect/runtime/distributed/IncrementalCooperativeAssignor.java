@@ -19,6 +19,7 @@ package org.apache.kafka.connect.runtime.distributed;
 import org.apache.kafka.common.utils.ExponentialBackoff;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.connect.runtime.ConnectorConfig;
 import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.ConnectorsAndTasks;
 import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.WorkerLoad;
 import org.apache.kafka.connect.storage.ClusterConfigState;
@@ -341,7 +342,7 @@ public class IncrementalCooperativeAssignor implements ConnectAssignor {
                 .build();
 
         assignConnectors(nextWorkerAssignment, toAssign.connectors());
-        assignTasks(nextWorkerAssignment, toAssign.tasks());
+        assignTasks(nextWorkerAssignment, toAssign.tasks(), configSnapshot);
 
         Map<String, Collection<String>> nextConnectorAssignments = nextWorkerAssignment.stream()
                 .collect(Collectors.toMap(
@@ -798,7 +799,27 @@ public class IncrementalCooperativeAssignor implements ConnectAssignor {
      * @param workerAssignment the current worker assignment; assigned tasks are added to this list
      * @param tasks the tasks to be assigned
      */
-    protected void assignTasks(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
+    protected void assignTasks(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks, ClusterConfigState configSnapshot) {
+        // Group tasks by connector for capacity-aware allocation
+        Map<String, List<ConnectorTaskId>> tasksByConnector = tasks.stream()
+                .collect(Collectors.groupingBy(ConnectorTaskId::connector));
+
+        boolean hasWeightedTasks = tasksByConnector.keySet().stream()
+                .anyMatch(connector -> getTaskWeight(connector, configSnapshot) > ConnectorConfig.TASKS_WEIGHT_DEFAULT);
+
+        if (hasWeightedTasks) {
+            // Use capacity-aware assignment for weighted tasks
+            assignTasksCapacityAware(workerAssignment, tasksByConnector, configSnapshot);
+        } else {
+            // Fall back to original round-robin assignment for backward compatibility
+            assignTasksRoundRobin(workerAssignment, tasks);
+        }
+    }
+
+    /**
+     * Original round-robin task assignment for backward compatibility.
+     */
+    private void assignTasksRoundRobin(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
         workerAssignment.sort(WorkerLoad.taskComparator());
         WorkerLoad first = workerAssignment.get(0);
 
@@ -811,12 +832,73 @@ public class IncrementalCooperativeAssignor implements ConnectAssignor {
                     .orElse(workerAssignment.size());
             for (WorkerLoad worker : workerAssignment.subList(0, upTo)) {
                 ConnectorTaskId task = load.next();
-                log.debug("Assigning task {} to {}", task, worker.worker());
+                log.debug("Assigning task {} to {} (round-robin)", task, worker.worker());
                 worker.assign(task);
                 if (!load.hasNext()) {
                     break;
                 }
             }
+        }
+    }
+
+    /**
+     * Capacity-aware task assignment considering task weights and CPU capacity.
+     */
+    private void assignTasksCapacityAware(List<WorkerLoad> workerAssignment, 
+                                        Map<String, List<ConnectorTaskId>> tasksByConnector,
+                                        ClusterConfigState configSnapshot) {
+        for (Map.Entry<String, List<ConnectorTaskId>> entry : tasksByConnector.entrySet()) {
+            String connectorName = entry.getKey();
+            List<ConnectorTaskId> connectorTasks = entry.getValue();
+            int taskWeight = getTaskWeight(connectorName, configSnapshot);
+
+            for (ConnectorTaskId taskId : connectorTasks) {
+                WorkerLoad bestWorker = findBestWorkerForTask(workerAssignment, taskWeight);
+                log.debug("Assigning task {} to {} with weight {} (capacity-aware)", 
+                         taskId, bestWorker.worker(), taskWeight);
+                bestWorker.assign(taskId, taskWeight);
+            }
+        }
+    }
+
+    /**
+     * Find the best worker for a task considering capacity constraints.
+     */
+    private WorkerLoad findBestWorkerForTask(List<WorkerLoad> workers, int taskWeight) {
+        // Sort workers by capacity-aware comparator
+        workers.sort(WorkerLoad.capacityAwareTaskComparator());
+        
+        // Try to find a worker that can accommodate the task weight
+        WorkerLoad bestWorker = workers.stream()
+                .filter(worker -> worker.canAccommodateTask(taskWeight))
+                .findFirst()
+                .orElse(workers.get(0)); // Fallback to least loaded worker
+        
+        return bestWorker;
+    }
+
+    /**
+     * Get the task weight for a connector from its configuration.
+     */
+    private int getTaskWeight(String connectorName, ClusterConfigState configSnapshot) {
+        Map<String, String> connectorConfig = configSnapshot.connectorConfig(connectorName);
+        if (connectorConfig == null) {
+            return ConnectorConfig.TASKS_WEIGHT_DEFAULT;
+        }
+        
+        String weightStr = connectorConfig.get(ConnectorConfig.TASKS_WEIGHT_CONFIG);
+        if (weightStr == null) {
+            return ConnectorConfig.TASKS_WEIGHT_DEFAULT;
+        }
+        
+        try {
+            int weight = Integer.parseInt(weightStr);
+            // Validate range (should be handled by ConfigDef, but double-check for safety)
+            return Math.max(1, Math.min(100, weight));
+        } catch (NumberFormatException e) {
+            log.warn("Invalid task weight '{}' for connector '{}', using default weight {}",
+                    weightStr, connectorName, ConnectorConfig.TASKS_WEIGHT_DEFAULT);
+            return ConnectorConfig.TASKS_WEIGHT_DEFAULT;
         }
     }
 

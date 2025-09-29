@@ -31,7 +31,7 @@ TAGS
 Vagrantfile.local
 /logs
 .DS_Store
-
+bin/
 config/server-*
 config/zookeeper-*
 gradle/wrapper/*.jar

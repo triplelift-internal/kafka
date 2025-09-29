@@ -57,6 +57,7 @@ import java.util.stream.Stream;
 
 import static org.apache.kafka.common.config.ConfigDef.NonEmptyStringWithoutControlChars.nonEmptyStringWithoutControlChars;
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
+import static org.apache.kafka.common.config.ConfigDef.Range.between;
 import static org.apache.kafka.common.config.ConfigDef.ValidString.in;
 
 /**
@@ -151,6 +152,16 @@ public class ConnectorConfig extends AbstractConfig {
     public static final boolean TASKS_MAX_ENFORCE_DEFAULT = true;
     private static final String TASKS_MAX_ENFORCE_DISPLAY = "Enforce tasks max";
 
+    public static final String TASKS_WEIGHT_CONFIG = "tasks.weight";
+    private static final String TASKS_WEIGHT_DOC = 
+            "Task weight factor (1-100) indicating CPU intensity. 1=lightweight task " +
+            "(100 tasks can share 1 CPU core), 100=dedicated CPU core per task. " +
+            "Weight of 1 maintains traditional round-robin behavior for backward compatibility.";
+    public static final int TASKS_WEIGHT_DEFAULT = 1;
+    private static final int TASKS_WEIGHT_MIN = 1;
+    private static final int TASKS_WEIGHT_MAX = 100;
+    private static final String TASKS_WEIGHT_DISPLAY = "Task weight";
+
     public static final String TRANSFORMS_CONFIG = "transforms";
     private static final String TRANSFORMS_DOC = "Aliases for the transformations to be applied to records.";
     private static final String TRANSFORMS_DISPLAY = "Transforms";
@@ -243,6 +254,7 @@ public class ConnectorConfig extends AbstractConfig {
                 .define(CONNECTOR_VERSION, Type.STRING, defaultConnectorVersion, CONNECTOR_VERSION_VALIDATOR, Importance.MEDIUM, CONNECTOR_VERSION_DOC, COMMON_GROUP, ++orderInGroup, Width.MEDIUM, CONNECTOR_VERSION_DISPLAY, recommender.connectorPluginVersionRecommender())
                 .define(TASKS_MAX_CONFIG, Type.INT, TASKS_MAX_DEFAULT, atLeast(TASKS_MIN_CONFIG), Importance.HIGH, TASKS_MAX_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, TASK_MAX_DISPLAY)
                 .define(TASKS_MAX_ENFORCE_CONFIG, Type.BOOLEAN, TASKS_MAX_ENFORCE_DEFAULT, Importance.LOW, TASKS_MAX_ENFORCE_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, TASKS_MAX_ENFORCE_DISPLAY)
+                .define(TASKS_WEIGHT_CONFIG, Type.INT, TASKS_WEIGHT_DEFAULT, between(TASKS_WEIGHT_MIN, TASKS_WEIGHT_MAX), Importance.MEDIUM, TASKS_WEIGHT_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, TASKS_WEIGHT_DISPLAY)
                 .define(KEY_CONVERTER_CLASS_CONFIG, Type.CLASS, keyConverterDefaults.type, KEY_CONVERTER_CLASS_VALIDATOR, Importance.LOW, KEY_CONVERTER_CLASS_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, KEY_CONVERTER_CLASS_DISPLAY, recommender.converterPluginRecommender())
                 .define(KEY_CONVERTER_VERSION_CONFIG, Type.STRING, keyConverterDefaults.version, KEY_CONVERTER_VERSION_VALIDATOR, Importance.LOW, KEY_CONVERTER_VERSION_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, KEY_CONVERTER_VERSION_DISPLAY, recommender.keyConverterPluginVersionRecommender())
                 .define(VALUE_CONVERTER_CLASS_CONFIG, Type.CLASS, valueConverterDefaults.type, VALUE_CONVERTER_CLASS_VALIDATOR, Importance.LOW, VALUE_CONVERTER_CLASS_DOC, COMMON_GROUP, ++orderInGroup, Width.SHORT, VALUE_CONVERTER_CLASS_DISPLAY, recommender.converterPluginRecommender())
@@ -803,5 +815,13 @@ public class ConnectorConfig extends AbstractConfig {
                 throw new VersionedPluginLoadingException(e.getMessage());
             }
         }
+    }
+
+    /**
+     * Get the task weight for this connector.
+     * @return the task weight (1-5), or 1 if not configured
+     */
+    public int tasksWeight() {
+        return getInt(TASKS_WEIGHT_CONFIG);
     }
 }

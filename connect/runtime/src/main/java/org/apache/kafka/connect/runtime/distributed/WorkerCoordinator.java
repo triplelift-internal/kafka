@@ -28,6 +28,7 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Timer;
 import org.apache.kafka.connect.storage.ClusterConfigState;
 import org.apache.kafka.connect.storage.ConfigBackingStore;
+import org.apache.kafka.connect.runtime.WorkerInfo;
 import org.apache.kafka.connect.util.ConnectorTaskId;
 
 import org.slf4j.Logger;
@@ -530,6 +531,8 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
         private final String worker;
         private final Collection<String> connectors;
         private final Collection<ConnectorTaskId> tasks;
+        private final int availableCpuCores;
+        private int currentCpuLoad; // Sum of task weights currently assigned (1-100 per task)
 
         private WorkerLoad(
                 String worker,
@@ -539,6 +542,9 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
             this.worker = worker;
             this.connectors = connectors;
             this.tasks = tasks;
+            // Detect system CPU cores using management API (similar to WorkerInfo)
+            this.availableCpuCores = Runtime.getRuntime().availableProcessors();
+            this.currentCpuLoad = 0;
         }
 
         public static class Builder {
@@ -603,6 +609,69 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
             tasks.add(task);
         }
 
+        /**
+         * Assign a task with a specific weight for capacity-aware allocation.
+         * @param task the task to assign
+         * @param weight the task weight (1-100)
+         */
+        public void assign(ConnectorTaskId task, int weight) {
+            tasks.add(task);
+            currentCpuLoad += weight;
+        }
+
+        /**
+         * Check if this worker can accommodate a task with the given weight.
+         * With the 1-100 scale, each CPU core can handle up to 100 weight units.
+         * @param weight the task weight (1-100)
+         * @return true if the worker has sufficient CPU capacity
+         */
+        public boolean canAccommodateTask(int weight) {
+            int totalCapacity = availableCpuCores * 100; // Each core can handle 100 weight units
+            return (currentCpuLoad + weight) <= totalCapacity;
+        }
+
+        /**
+         * Get the current CPU load as a ratio of total capacity.
+         * With 1-100 scale: total capacity = cores * 100
+         * @return CPU load ratio (0.0 to 1.0+)
+         */
+        public double effectiveCpuLoad() {
+            int totalCapacity = availableCpuCores * 100; // Each core handles 100 weight units
+            return (double) currentCpuLoad / totalCapacity;
+        }
+
+        /**
+         * Get the number of available CPU cores.
+         * @return number of CPU cores
+         */
+        public int availableCpuCores() {
+            return availableCpuCores;
+        }
+
+        /**
+         * Get the current CPU load (sum of task weights).
+         * @return current CPU load (sum of 1-100 weights)
+         */
+        public int currentCpuLoad() {
+            return currentCpuLoad;
+        }
+
+        /**
+         * Get the total CPU capacity in weight units.
+         * @return total capacity (cores * 100)
+         */
+        public int totalCpuCapacity() {
+            return availableCpuCores * 100;
+        }
+
+        /**
+         * Get the remaining CPU capacity in weight units.
+         * @return remaining capacity
+         */
+        public int remainingCpuCapacity() {
+            return totalCpuCapacity() - currentCpuLoad;
+        }
+
         public int size() {
             return connectors.size() + tasks.size();
         }
@@ -626,6 +695,29 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
                 return res != 0 ? res : left.worker == null
                                         ? right.worker == null ? 0 : -1
                                         : left.worker.compareTo(right.worker);
+            };
+        }
+
+        /**
+         * Capacity-aware task comparator that considers CPU load and available capacity.
+         * Workers with lower CPU utilization ratio are preferred.
+         */
+        public static Comparator<WorkerLoad> capacityAwareTaskComparator() {
+            return (left, right) -> {
+                // First compare by CPU load ratio
+                int loadComparison = Double.compare(left.effectiveCpuLoad(), right.effectiveCpuLoad());
+                if (loadComparison != 0) {
+                    return loadComparison;
+                }
+                // If CPU load is equal, compare by task count
+                int taskComparison = left.tasks.size() - right.tasks.size();
+                if (taskComparison != 0) {
+                    return taskComparison;
+                }
+                // Finally, compare by worker name for deterministic ordering
+                return left.worker == null 
+                       ? (right.worker == null ? 0 : -1)
+                       : left.worker.compareTo(right.worker);
             };
         }
 
