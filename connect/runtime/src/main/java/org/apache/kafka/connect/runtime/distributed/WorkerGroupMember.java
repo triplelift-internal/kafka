@@ -19,7 +19,6 @@ package org.apache.kafka.connect.runtime.distributed;
 import org.apache.kafka.clients.ApiVersions;
 import org.apache.kafka.clients.ClientUtils;
 import org.apache.kafka.clients.CommonClientConfigs;
-import org.apache.kafka.clients.GroupRebalanceConfig;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.MetadataRecoveryStrategy;
 import org.apache.kafka.clients.NetworkClient;
@@ -134,7 +133,7 @@ public class WorkerGroupMember {
                     config.getInt(CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG),
                     Integer.MAX_VALUE);
             this.coordinator = new WorkerCoordinator(
-                    new GroupRebalanceConfig(config, GroupRebalanceConfig.ProtocolType.CONNECT),
+                    config,
                     logContext,
                     this.client,
                     metrics,

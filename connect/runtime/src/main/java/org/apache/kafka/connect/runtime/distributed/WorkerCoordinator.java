@@ -44,6 +44,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocolCollection;
 import static org.apache.kafka.common.message.JoinGroupResponseData.JoinGroupResponseMember;
@@ -70,12 +71,14 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
     private volatile int lastCompletedGenerationId;
     private final ConnectAssignor eagerAssignor;
     private final ConnectAssignor incrementalAssignor;
+    private final ConnectAssignor globalBalanceAssignor;
+    private final DistributedConfig distributedConfig;
     private final int coordinatorDiscoveryTimeoutMs;
 
     /**
      * Initialize the coordination manager.
      */
-    public WorkerCoordinator(GroupRebalanceConfig config,
+    public WorkerCoordinator(DistributedConfig distributedConfig,
                              LogContext logContext,
                              ConsumerNetworkClient client,
                              Metrics metrics,
@@ -86,7 +89,7 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
                              WorkerRebalanceListener listener,
                              ConnectProtocolCompatibility protocolCompatibility,
                              int maxDelay) {
-        super(config,
+        super(new GroupRebalanceConfig(distributedConfig, GroupRebalanceConfig.ProtocolType.CONNECT),
               logContext,
               client,
               metrics,
@@ -100,10 +103,12 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
         this.listener = listener;
         this.rejoinRequested = false;
         this.protocolCompatibility = protocolCompatibility;
+        this.distributedConfig = distributedConfig;
         this.incrementalAssignor = new IncrementalCooperativeAssignor(logContext, time, maxDelay);
+        this.globalBalanceAssignor = new GlobalBalanceAssignor(logContext, time, maxDelay);
         this.eagerAssignor = new EagerAssignor(logContext);
         this.currentConnectProtocol = protocolCompatibility;
-        this.coordinatorDiscoveryTimeoutMs = config.heartbeatIntervalMs;
+        this.coordinatorDiscoveryTimeoutMs = distributedConfig.getInt(DistributedConfig.HEARTBEAT_INTERVAL_MS_CONFIG);
         this.lastCompletedGenerationId = Generation.NO_GENERATION.generationId;
     }
 
@@ -229,9 +234,18 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
             throw new IllegalStateException("Can't skip assignment because Connect does not support static membership.");
 
         ConnectProtocolCompatibility protocolCompatibility = ConnectProtocolCompatibility.fromProtocol(protocol);
-        return protocolCompatibility == EAGER
-               ? eagerAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this)
-               : incrementalAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this);
+
+        // Check if global task balance is enabled
+        boolean globalBalanceEnabled = distributedConfig.globalTaskBalanceEnabled();
+
+        if (protocolCompatibility == EAGER) {
+            return eagerAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this);
+        } else if (globalBalanceEnabled) {
+            log.info("Using global balance assignor for task assignment");
+            return globalBalanceAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this);
+        } else {
+            return incrementalAssignor.performAssignment(leaderId, protocolCompatibility, allMemberMetadata, this);
+        }
     }
 
     @Override
@@ -650,6 +664,45 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
         @Override
         public int hashCode() {
             return Objects.hash(worker, connectors, tasks);
+        }
+
+        /**
+         * Get tasks for a specific connector
+         */
+        public Collection<ConnectorTaskId> tasksForConnector(String connectorName) {
+            return tasks.stream()
+                .filter(task -> task.connector().equals(connectorName))
+                .collect(Collectors.toList());
+        }
+
+        /**
+         * Get task count for a specific connector
+         */
+        public int taskCountForConnector(String connectorName) {
+            return (int) tasks.stream()
+                .filter(task -> task.connector().equals(connectorName))
+                .count();
+        }
+
+        /**
+         * Get number of unique connectors this worker handles tasks for
+         */
+        public long uniqueConnectorTaskCount() {
+            return tasks.stream()
+                .map(ConnectorTaskId::connector)
+                .distinct()
+                .count();
+        }
+
+        /**
+         * Comparator for global balance - considers connector task distribution
+         */
+        public static Comparator<WorkerLoad> globalBalanceComparator() {
+            return Comparator
+                .comparing(WorkerLoad::tasksSize)
+                .thenComparing(WorkerLoad::connectorsSize)
+                .thenComparing(WorkerLoad::uniqueConnectorTaskCount)
+                .thenComparing(w -> w.worker);
         }
     }
 
