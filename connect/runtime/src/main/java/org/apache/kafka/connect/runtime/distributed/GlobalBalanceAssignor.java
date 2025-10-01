@@ -25,7 +25,7 @@ import org.slf4j.Logger;
 
 import java.util.Collection;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -43,57 +43,90 @@ import java.util.stream.Collectors;
  */
 public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
     private final Logger log;
-    
+
     public GlobalBalanceAssignor(LogContext logContext, Time time, int maxDelay) {
         super(logContext, time, maxDelay);
         this.log = logContext.logger(GlobalBalanceAssignor.class);
     }
-    
+
     @Override
     protected void assignTasks(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
-        log.debug("Assigning {} tasks with global balance strategy across {} workers", 
+        if (tasks.isEmpty() || workerAssignment.isEmpty()) {
+            return;
+        }
+
+        log.debug("Assigning {} tasks with global balance across {} workers",
                   tasks.size(), workerAssignment.size());
-        assignTasksWithGlobalBalance(workerAssignment, tasks);
+
+        // Identify which tasks are currently assigned and which are new/unassigned
+        Set<ConnectorTaskId> currentlyAssigned = workerAssignment.stream()
+                .flatMap(worker -> worker.tasks().stream())
+                .collect(Collectors.toSet());
+
+        Collection<ConnectorTaskId> unassignedTasks = tasks.stream()
+                .filter(task -> !currentlyAssigned.contains(task))
+                .collect(Collectors.toList());
+
+        // Check if this is a full rebalance request (all tasks are already assigned)
+        boolean isFullRebalance = unassignedTasks.isEmpty() && !tasks.isEmpty();
+
+        if (isFullRebalance) {
+            log.debug("Performing full rebalance - clearing current assignments and redistributing all tasks");
+            // Clear existing task assignments for full rebalance
+            for (WorkerLoad worker : workerAssignment) {
+                worker.tasks().clear();
+            }
+            // Assign all tasks using simple round-robin for global balance
+            assignTasksRoundRobin(workerAssignment, tasks);
+        } else if (!unassignedTasks.isEmpty()) {
+            log.debug("Performing incremental assignment for {} unassigned tasks", unassignedTasks.size());
+            // Assign unassigned tasks considering existing load for balance
+            assignTasksLoadAware(workerAssignment, unassignedTasks);
+        } else {
+            // All tasks are already assigned, nothing to do
+            log.debug("All tasks are already assigned, no assignment needed");
+        }
     }
-    
+
+    /**
+     * Assigns tasks using round-robin distribution for global balance.
+     */
+    private void assignTasksRoundRobin(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
+        // Sort workers consistently for deterministic assignment
+        workerAssignment.sort((w1, w2) -> w1.worker().compareTo(w2.worker()));
+
+        // Convert tasks to list for indexed access and sort for deterministic assignment
+        List<ConnectorTaskId> taskList = tasks.stream()
+                .sorted((t1, t2) -> {
+                    int connectorCompare = t1.connector().compareTo(t2.connector());
+                    if (connectorCompare != 0) return connectorCompare;
+                    return Integer.compare(t1.task(), t2.task());
+                })
+                .collect(Collectors.toList());
+
+        log.debug("Round-robin assigning {} tasks across {} workers for optimal global balance",
+                  taskList.size(), workerAssignment.size());
+
+        // Simple round-robin across all workers for perfect global balance
+        int workerIndex = 0;
+        for (ConnectorTaskId task : taskList) {
+            WorkerLoad targetWorker = workerAssignment.get(workerIndex % workerAssignment.size());
+            targetWorker.assign(task);
+
+            log.debug("Assigning task {} to worker {} (round-robin global index {})",
+                     task, targetWorker.worker(), workerIndex);
+
+            workerIndex++;
+        }
+    }
+
     @Override
     protected void assignConnectors(List<WorkerLoad> workerAssignment, Collection<String> connectors) {
         log.debug("Assigning {} connectors with global balance strategy across {} workers", 
                   connectors.size(), workerAssignment.size());
         assignConnectorsWithGlobalBalance(workerAssignment, connectors);
     }
-    
-    /**
-     * Assigns tasks with global balance strategy. Tasks are grouped by connector
-     * and each connector's tasks are distributed evenly across all workers.
-     */
-    private void assignTasksWithGlobalBalance(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
-        if (tasks.isEmpty() || workerAssignment.isEmpty()) {
-            return;
-        }
 
-        // Group tasks by connector
-        Map<String, List<ConnectorTaskId>> tasksByConnector = groupTasksByConnector(tasks);
-        
-        log.debug("Grouped {} tasks into {} connector groups: {}", 
-                  tasks.size(), tasksByConnector.size(), tasksByConnector.keySet());
-        
-        // For each connector group, distribute tasks evenly across workers
-        for (Map.Entry<String, List<ConnectorTaskId>> entry : tasksByConnector.entrySet()) {
-            String connectorName = entry.getKey();
-            List<ConnectorTaskId> connectorTasks = entry.getValue();
-            
-            log.debug("Distributing {} tasks for connector {} across {} workers", 
-                      connectorTasks.size(), connectorName, workerAssignment.size());
-            
-            // Sort workers by current task load for balanced assignment
-            workerAssignment.sort(WorkerLoad.taskComparator());
-            
-            // Distribute tasks for this connector across all workers
-            distributeConnectorTasksGlobally(workerAssignment, connectorTasks);
-        }
-    }
-    
     /**
      * Assigns connectors with global balance strategy, ensuring even distribution
      * of connectors across workers.
@@ -105,50 +138,52 @@ public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
 
         // Convert to list for indexed access
         List<String> connectorList = connectors.stream().collect(Collectors.toList());
-        
+
         // Round-robin assignment of connectors
         for (int i = 0; i < connectorList.size(); i++) {
             // Sort workers by connector load to maintain balance
             workerAssignment.sort(WorkerLoad.connectorComparator());
-            
+
             String connector = connectorList.get(i);
             WorkerLoad leastLoadedWorker = workerAssignment.get(0);
-            
+
             log.debug("Assigning connector {} to worker {} (current connector load: {})", 
                       connector, leastLoadedWorker.worker(), leastLoadedWorker.connectorsSize());
-            
+
             leastLoadedWorker.assign(connector);
         }
     }
-    
-    /**
-     * Groups tasks by their connector name.
-     */
-    private Map<String, List<ConnectorTaskId>> groupTasksByConnector(Collection<ConnectorTaskId> tasks) {
-        return tasks.stream()
-                .collect(Collectors.groupingBy(ConnectorTaskId::connector));
-    }
-    
-    /**
-     * Distributes a connector's tasks globally across all workers using round-robin.
-     * This ensures that tasks for the same connector are spread evenly rather than
-     * being co-located on the same worker.
-     */
-    private void distributeConnectorTasksGlobally(List<WorkerLoad> workerAssignment, List<ConnectorTaskId> connectorTasks) {
-        if (connectorTasks.isEmpty() || workerAssignment.isEmpty()) {
-            return;
-        }
 
-        // Round-robin distribution across all workers for this connector's tasks
-        int workerIndex = 0;
-        for (ConnectorTaskId task : connectorTasks) {
-            WorkerLoad worker = workerAssignment.get(workerIndex);
-            
-            log.debug("Assigning task {} to worker {} (current task load: {})", 
-                      task, worker.worker(), worker.tasksSize());
-            
-            worker.assign(task);
-            workerIndex = (workerIndex + 1) % workerAssignment.size();
+    /**
+     * Assigns tasks considering existing load for optimal global balance.
+     */
+    private void assignTasksLoadAware(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
+        // Convert tasks to list for sorting
+        List<ConnectorTaskId> taskList = tasks.stream()
+                .sorted((t1, t2) -> {
+                    int connectorCompare = t1.connector().compareTo(t2.connector());
+                    if (connectorCompare != 0) return connectorCompare;
+                    return Integer.compare(t1.task(), t2.task());
+                })
+                .collect(Collectors.toList());
+
+        log.debug("Load-aware assigning {} tasks across {} workers for optimal global balance",
+                  taskList.size(), workerAssignment.size());
+
+        // For each task, assign to the worker with the least current load
+        for (ConnectorTaskId task : taskList) {
+            // Sort workers by current task load (least loaded first)
+            workerAssignment.sort((w1, w2) -> {
+                int loadDiff = w1.tasksSize() - w2.tasksSize();
+                if (loadDiff != 0) return loadDiff;
+                return w1.worker().compareTo(w2.worker()); // Deterministic tie-breaker
+            });
+
+            WorkerLoad leastLoadedWorker = workerAssignment.get(0);
+            leastLoadedWorker.assign(task);
+
+            log.debug("Assigning task {} to worker {} (current load: {} tasks)",
+                     task, leastLoadedWorker.worker(), leastLoadedWorker.tasksSize() - 1);
         }
     }
 }

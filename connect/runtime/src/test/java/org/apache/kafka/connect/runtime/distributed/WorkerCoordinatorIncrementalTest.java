@@ -16,7 +16,6 @@
  */
 package org.apache.kafka.connect.runtime.distributed;
 
-import org.apache.kafka.clients.GroupRebalanceConfig;
 import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.clients.MockClient;
 import org.apache.kafka.clients.consumer.internals.ConsumerNetworkClient;
@@ -43,10 +42,10 @@ import org.mockito.quality.Strictness;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.stream.Stream;
 
 import static org.apache.kafka.common.message.JoinGroupRequestData.JoinGroupRequestProtocol;
@@ -91,7 +90,7 @@ public class WorkerCoordinatorIncrementalTest {
     private MockRebalanceListener rebalanceListener;
     @Mock
     private KafkaConfigBackingStore configStorage;
-    private GroupRebalanceConfig rebalanceConfig;
+    private DistributedConfig distributedConfig;
     private WorkerCoordinator coordinator;
     private int rebalanceDelay = DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT;
 
@@ -142,16 +141,21 @@ public class WorkerCoordinatorIncrementalTest {
 
         this.configStorageCalls = 0;
 
-        this.rebalanceConfig = new GroupRebalanceConfig(sessionTimeoutMs,
-            rebalanceTimeoutMs,
-            heartbeatIntervalMs,
-            groupId,
-            Optional.empty(),
-            null,
-            retryBackoffMs,
-            retryBackoffMaxMs,
-            true);
-        this.coordinator = new WorkerCoordinator(rebalanceConfig,
+        // Create DistributedConfig with minimal required properties
+        Map<String, String> props = new HashMap<>();
+        props.put(DistributedConfig.GROUP_ID_CONFIG, groupId);
+        props.put(DistributedConfig.SESSION_TIMEOUT_MS_CONFIG, String.valueOf(sessionTimeoutMs));
+        props.put(DistributedConfig.REBALANCE_TIMEOUT_MS_CONFIG, String.valueOf(rebalanceTimeoutMs));
+        props.put(DistributedConfig.HEARTBEAT_INTERVAL_MS_CONFIG, String.valueOf(heartbeatIntervalMs));
+        props.put(DistributedConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(DistributedConfig.CONFIG_TOPIC_CONFIG, "connect-configs");
+        props.put(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG, "connect-offsets");
+        props.put(DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG, "connect-status");
+        props.put(DistributedConfig.KEY_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
+        props.put(DistributedConfig.VALUE_CONVERTER_CLASS_CONFIG, "org.apache.kafka.connect.json.JsonConverter");
+        
+        this.distributedConfig = new DistributedConfig(props);
+        this.coordinator = new WorkerCoordinator(distributedConfig,
             loggerFactory,
             consumerClient,
             metrics,
