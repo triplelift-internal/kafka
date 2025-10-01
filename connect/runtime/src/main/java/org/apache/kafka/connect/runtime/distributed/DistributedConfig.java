@@ -182,6 +182,16 @@ public class DistributedConfig extends WorkerConfig {
             + "period the connectors and tasks of the departed workers remain unassigned";
     public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));
 
+    /**
+     * <code>global.task.balance.enabled</code>
+     */
+    public static final String GLOBAL_TASK_BALANCE_ENABLED_CONFIG = "global.task.balance.enabled";
+    public static final String GLOBAL_TASK_BALANCE_ENABLED_DOC = "When enabled, prioritizes global balance of tasks " +
+            "over availability and continuity. Tasks for the same connector are spread evenly across all available " +
+            "worker nodes rather than being placed together. This provides better load distribution but may impact " +
+            "connector locality. This feature is useful specially for autoscaled worker node environment under heavy load.";
+    public static final boolean GLOBAL_TASK_BALANCE_ENABLED_DEFAULT = false;
+
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys. "
@@ -475,6 +485,11 @@ public class DistributedConfig extends WorkerConfig {
                     between(0, Integer.MAX_VALUE),
                     ConfigDef.Importance.LOW,
                     SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC)
+            .define(GLOBAL_TASK_BALANCE_ENABLED_CONFIG,
+                    ConfigDef.Type.BOOLEAN,
+                    GLOBAL_TASK_BALANCE_ENABLED_DEFAULT,
+                    ConfigDef.Importance.MEDIUM,
+                    GLOBAL_TASK_BALANCE_ENABLED_DOC)
             .define(INTER_WORKER_KEY_TTL_MS_CONFIG,
                     ConfigDef.Type.INT,
                     INTER_WORKER_KEY_TTL_MS_MS_DEFAULT,
@@ -553,6 +568,10 @@ public class DistributedConfig extends WorkerConfig {
     @Override
     public boolean connectorOffsetsTopicsPermitted() {
         return true;
+    }
+
+    public boolean globalTaskBalanceEnabled() {
+        return getBoolean(GLOBAL_TASK_BALANCE_ENABLED_CONFIG);
     }
 
     @Override

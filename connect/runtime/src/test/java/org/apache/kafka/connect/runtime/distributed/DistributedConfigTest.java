@@ -474,4 +474,42 @@ public class DistributedConfigTest {
         new DistributedConfig(configs);
     }
 
+    @Test
+    public void testGlobalTaskBalanceConfigDefault() {
+        Map<String, String> props = getMinimalConfig();
+        DistributedConfig config = new DistributedConfig(props);
+
+        // Default should be false
+        assertFalse(config.globalTaskBalanceEnabled());
+    }
+
+    @Test
+    public void testGlobalTaskBalanceConfigEnabled() {
+        Map<String, String> props = getMinimalConfig();
+        props.put(DistributedConfig.GLOBAL_TASK_BALANCE_ENABLED_CONFIG, "true");
+        DistributedConfig config = new DistributedConfig(props);
+
+        assertTrue(config.globalTaskBalanceEnabled());
+    }
+
+    @Test
+    public void testGlobalTaskBalanceConfigDisabled() {
+        Map<String, String> props = getMinimalConfig();
+        props.put(DistributedConfig.GLOBAL_TASK_BALANCE_ENABLED_CONFIG, "false");
+        DistributedConfig config = new DistributedConfig(props);
+
+        assertFalse(config.globalTaskBalanceEnabled());
+    }
+
+    private Map<String, String> getMinimalConfig() {
+        Map<String, String> props = new HashMap<>();
+        props.put(DistributedConfig.GROUP_ID_CONFIG, "test-group");
+        props.put(DistributedConfig.CONFIG_TOPIC_CONFIG, "test-config");
+        props.put(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG, "test-offsets");
+        props.put(DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG, "test-status");
+        props.put("bootstrap.servers", "localhost:9092");
+        props.put("key.converter", "org.apache.kafka.connect.json.JsonConverter");
+        props.put("value.converter", "org.apache.kafka.connect.json.JsonConverter");
+        return props;
+    }
 }
