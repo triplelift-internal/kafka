@@ -161,4 +161,51 @@ public class GlobalBalanceAssignorTest {
         assertEquals(1, worker.tasksForConnector("connector2").size());
         assertTrue(worker.tasksForConnector("nonexistent").isEmpty());
     }
+
+    @Test
+    public void testPerfectTaskBalanceRequirement() {
+        // Test the critical requirement: maximum difference of 1 task between workers
+        
+        // Test case 1: 100 tasks, 3 workers (the main example from requirements)
+        verifyPerfectBalance(100, 3);
+        
+        // Test case 2: Various scenarios  
+        verifyPerfectBalance(7, 3);   // [2, 2, 3]
+        verifyPerfectBalance(10, 4);  // [2, 2, 3, 3]
+        verifyPerfectBalance(1, 5);   // [0, 0, 0, 0, 1]
+    }
+
+    private void verifyPerfectBalance(int taskCount, int workerCount) {
+        // Create empty workers
+        List<WorkerLoad> workers = new ArrayList<>();
+        for (int i = 0; i < workerCount; i++) {
+            workers.add(new WorkerLoad.Builder("worker" + i).build());
+        }
+
+        // Create tasks
+        List<ConnectorTaskId> tasks = new ArrayList<>();
+        for (int i = 0; i < taskCount; i++) {
+            tasks.add(new ConnectorTaskId("connector" + (i % 3), i));
+        }
+
+        // Perform assignment
+        assignor.assignTasks(workers, tasks);
+
+        // Verify all tasks assigned
+        int totalAssigned = workers.stream().mapToInt(WorkerLoad::tasksSize).sum();
+        assertEquals(taskCount, totalAssigned, "All tasks should be assigned");
+
+        // Verify perfect balance constraint
+        int[] taskCounts = workers.stream().mapToInt(WorkerLoad::tasksSize).toArray();
+        int minTasks = Arrays.stream(taskCounts).min().orElse(0);
+        int maxTasks = Arrays.stream(taskCounts).max().orElse(0);
+        int difference = maxTasks - minTasks;
+
+        assertTrue(difference <= 1, 
+                  String.format("CRITICAL: Task balance violated! " +
+                               "Tasks: %d, Workers: %d, Distribution: %s, " +
+                               "Min: %d, Max: %d, Difference: %d (must be ≤ 1)",
+                               taskCount, workerCount, Arrays.toString(taskCounts),
+                               minTasks, maxTasks, difference));
+    }
 }
