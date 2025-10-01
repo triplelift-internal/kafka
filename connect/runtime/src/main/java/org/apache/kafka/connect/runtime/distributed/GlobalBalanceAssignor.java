@@ -28,6 +28,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * An assignor that prioritizes global balance of tasks over availability and continuity.
@@ -73,12 +74,18 @@ public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
 
         if (isFullRebalance) {
             log.debug("Performing full rebalance - clearing current assignments and redistributing all tasks");
+            // Capture original task distribution before clearing for balanced round-robin ordering
+            List<Integer> originalTaskCounts = workerAssignment.stream()
+                    .mapToInt(WorkerLoad::tasksSize)
+                    .boxed()
+                    .collect(Collectors.toList());
+            
             // Clear existing task assignments for full rebalance
             for (WorkerLoad worker : workerAssignment) {
                 worker.tasks().clear();
             }
             // Assign all tasks using simple round-robin for global balance
-            assignTasksRoundRobin(workerAssignment, tasks);
+            assignTasksRoundRobin(workerAssignment, tasks, originalTaskCounts);
         } else if (!unassignedTasks.isEmpty()) {
             log.debug("Performing incremental assignment for {} unassigned tasks", unassignedTasks.size());
             // Assign unassigned tasks considering existing load for balance
@@ -99,9 +106,19 @@ public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
      * - The first (N mod W) workers get one additional task
      * - Maximum difference between workers is always 1
      */
-    private void assignTasksRoundRobin(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
-        // Sort workers consistently for deterministic assignment
-        workerAssignment.sort((w1, w2) -> w1.worker().compareTo(w2.worker()));
+    private void assignTasksRoundRobin(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks, List<Integer> originalTaskCounts) {
+        // Create indices list to track original ordering with task counts
+        List<Integer> workerIndices = IntStream.range(0, workerAssignment.size())
+                .boxed()
+                .collect(Collectors.toList());
+        
+        // Sort worker indices by original task count descending (highest task count first), then by worker name for deterministic assignment
+        // This ensures workers that had more tasks before rebalance get priority in round-robin, achieving better balance
+        workerIndices.sort((i1, i2) -> {
+            int taskCountDiff = originalTaskCounts.get(i2) - originalTaskCounts.get(i1); // Descending order
+            if (taskCountDiff != 0) return taskCountDiff;
+            return workerAssignment.get(i1).worker().compareTo(workerAssignment.get(i2).worker()); // Deterministic tie-breaker
+        });
 
         // Convert tasks to list for indexed access and sort for deterministic assignment
         List<ConnectorTaskId> taskList = tasks.stream()
@@ -112,17 +129,18 @@ public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
                 })
                 .collect(Collectors.toList());
 
-        log.debug("Round-robin assigning {} tasks across {} workers for perfect global balance",
+        log.debug("Round-robin assigning {} tasks across {} workers for perfect global balance (highest original load first)",
                   taskList.size(), workerAssignment.size());
 
-        // Simple round-robin across all workers for perfect global balance
+        // Simple round-robin across all workers using the sorted worker indices for perfect global balance
         int workerIndex = 0;
         for (ConnectorTaskId task : taskList) {
-            WorkerLoad targetWorker = workerAssignment.get(workerIndex % workerAssignment.size());
+            int targetWorkerIndex = workerIndices.get(workerIndex % workerIndices.size());
+            WorkerLoad targetWorker = workerAssignment.get(targetWorkerIndex);
             targetWorker.assign(task);
 
-            log.debug("Assigning task {} to worker {} (round-robin index {})",
-                     task, targetWorker.worker(), workerIndex);
+            log.debug("Assigning task {} to worker {} (round-robin index {}, original load: {})",
+                     task, targetWorker.worker(), workerIndex, originalTaskCounts.get(targetWorkerIndex));
 
             workerIndex++;
         }
@@ -193,13 +211,13 @@ public class GlobalBalanceAssignor extends IncrementalCooperativeAssignor {
         // For each task, assign to the worker with the least current load
         // This guarantees perfect balance with maximum difference of 1
         for (ConnectorTaskId task : taskList) {
-            // Sort workers by current task load (least loaded first)
-            // In case of ties, use worker name for deterministic assignment
-            workerAssignment.sort((w1, w2) -> {
-                int loadDiff = w1.tasksSize() - w2.tasksSize();
-                if (loadDiff != 0) return loadDiff;
-                return w1.worker().compareTo(w2.worker()); // Deterministic tie-breaker
-            });
+            // Sort workers prioritizing connector-specific task count first, then overall load
+            // This ensures even distribution within each connector before considering overall balance
+            workerAssignment.sort(java.util.Comparator
+                .comparingInt((WorkerLoad w) -> w.taskCountForConnector(task.connector()))
+                .thenComparingInt(WorkerLoad::tasksSize)
+                .thenComparingLong(WorkerLoad::uniqueConnectorTaskCount)
+                .thenComparing(WorkerLoad::worker));
 
             WorkerLoad leastLoadedWorker = workerAssignment.get(0);
             leastLoadedWorker.assign(task);
