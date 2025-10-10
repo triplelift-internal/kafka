@@ -81,7 +81,8 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
                              ConfigBackingStore configStorage,
                              WorkerRebalanceListener listener,
                              ConnectProtocolCompatibility protocolCompatibility,
-                             int maxDelay) {
+                             int maxDelay,
+                             boolean enableGlobalBalanceTaskAssignor) {
         super(config,
               logContext,
               client,
@@ -96,7 +97,9 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
         this.listener = listener;
         this.rejoinRequested = false;
         this.protocolCompatibility = protocolCompatibility;
-        this.incrementalAssignor = new IncrementalCooperativeAssignor(logContext, time, maxDelay);
+        this.incrementalAssignor = enableGlobalBalanceTaskAssignor
+                ? new GlobalBalanceTaskAssignor(logContext, time, maxDelay)
+                : new IncrementalCooperativeAssignor(logContext, time, maxDelay);
         this.eagerAssignor = new EagerAssignor(logContext);
         this.currentConnectProtocol = protocolCompatibility;
         this.coordinatorDiscoveryTimeoutMs = config.heartbeatIntervalMs;

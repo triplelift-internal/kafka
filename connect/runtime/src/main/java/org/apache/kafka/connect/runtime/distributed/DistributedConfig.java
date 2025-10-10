@@ -182,6 +182,17 @@ public class DistributedConfig extends WorkerConfig {
             + "period the connectors and tasks of the departed workers remain unassigned";
     public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));
 
+    /**
+     * <code>enable.global.balance.task.assignor</code>
+     */
+    public static final String ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_CONFIG = "enable.global.balance.task.assignor";
+    public static final String ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DOC = "Enable the global balance task assignor "
+            + "which ensures strict per-consumer and global balance requirements: "
+            + "1) Task count difference across workers ≤ 1 for each consumer group; "
+            + "2) Total task count difference across workers ≤ 1. "
+            + "When enabled, this assignor provides better load distribution compared to the default incremental cooperative assignor.";
+    public static final boolean ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DEFAULT = false;
+
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys. "
@@ -469,6 +480,11 @@ public class DistributedConfig extends WorkerConfig {
                     between(0, Integer.MAX_VALUE),
                     ConfigDef.Importance.LOW,
                     SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC)
+            .define(ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_CONFIG,
+                    ConfigDef.Type.BOOLEAN,
+                    ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DEFAULT,
+                    ConfigDef.Importance.MEDIUM,
+                    ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DOC)
             .define(INTER_WORKER_KEY_TTL_MS_CONFIG,
                     ConfigDef.Type.INT,
                     INTER_WORKER_KEY_TTL_MS_MS_DEFAULT,

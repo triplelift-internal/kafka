@@ -1,6 +1,22 @@
-# Kafka Connect Distributed Mode - Global Task Assignor Behavior
+<!--
+Licensed to the Apache Software Foundation (ASF) under one or more
+contributor license agreements.  See the NOTICE file distributed with
+this work for additional information regarding copyright ownership.
+The ASF licenses this file to You under the Apache License, Version 2.0
+(the "License"); you may not use this file except in compliance with
+the License.  You may obtain a copy of the License at
 
-This document describes task allocation behavior for Kafka Connect in distributed mode across 4 scenarios, demonstrating worker-to-task assignments with strict balance requirements.
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+# Kafka Connect Distributed Mode - Global Balance Task Assignor Behavior
+
+This document describes task allocation behavior for Kafka Connect in distributed mode across 4 scenarios, demonstrating worker-to-task assignments with strict balance requirements. The number of Workers, Consumer Groups and Tasks for those Consumer Groups are an example. The acutal behavior for GlobalBalanceTaskAssignor should be capable of handling any number of Workers, Consumer Groups and Tasks.
 
 ## Balance Requirements
 
@@ -23,13 +39,13 @@ This document describes task allocation behavior for Kafka Connect in distribute
 
 ---
 
-## Scenario 1: Initial Allocation (Starting Unassigned State)
+## Scenario 1: Initial Allocation New Consumer Group Deployment
 
 ### Description
-New consumer group deployment with no pre-existing task assignments. Tasks are allocated evenly among all available worker nodes.
+A new consumer group deployment with no pre-existing task assignments. Tasks are allocated evenly among all available worker nodes.
 
 ### Behavior
-- Allocate equal number of tasks among all 5 available worker nodes
+- Allocate equal number of tasks among all available worker nodes, in this example 5
 - Per-consumer task count difference ≤ 1
 - Overall total tasks difference per worker ≤ 1
 
@@ -73,27 +89,7 @@ All consumers have maximum difference of 1 task across workers.
 
 ---
 
-## Scenario 2: Consumer Config Change / Redeployment
-
-### Description
-Configuration change or redeployment event for existing consumer groups.
-
-### Behavior
-- Trigger redeploy ensuring balance is retained in the same worker nodes
-- Worker-to-task affinity is retained
-- No task movement needed (deployment already balanced)
-
-### Before State
-5 Workers (W1-W5) with task allocation from Scenario 1.
-
-### After State
-5 Workers (W1-W5) - **Identical to Scenario 1**
-
-**No changes to task allocation. Worker-to-task affinity maintained.**
-
----
-
-## Scenario 3: Worker Scale Down Event
+## Scenario 2: Worker Scale Down Event
 
 ### Description
 Worker scale down event where 2 nodes are removed from the cluster (W4 and W5).
@@ -147,7 +143,7 @@ Tasks from W4 (12 tasks) and W5 (12 tasks) were redistributed to W1, W2, and W3,
 
 ---
 
-## Scenario 4: Worker Scale Up Event
+## Scenario 3: Worker Scale Up Event
 
 ### Description
 Worker scale up event where 3 new nodes are added to the cluster (W4, W5, W6).
@@ -215,6 +211,25 @@ All consumers maintain maximum difference of 1 task across workers.
 Rebalancing prioritizes consumers with highest task counts (C1 → C2 → C3) to minimize disruption while ensuring both per-consumer and global balance constraints are satisfied.
 
 ---
+
+## Scenario 4: Catch All & Consumer Config Change / Update
+
+### Description
+Catch all logic as well as for configuration changes or redeployment event for existing consumer groups.
+
+### Behavior
+- Trigger a full rebalance across all workers consumers and tasks ensuring balance is enforced
+- Per-Consumer Balance: Task count difference across workers ≤ 1 for each consumer group
+- Global Balance: Total task count difference across workers ≤ 1
+
+### Before State
+6 Workers (W1-W6) with task allocation from Scenario 3.
+
+### After State
+6 Workers (W1-W6) - **Balanced Workloads**
+
+---
+
 
 ## Summary
 
