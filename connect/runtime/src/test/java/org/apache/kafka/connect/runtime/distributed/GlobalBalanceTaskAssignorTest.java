@@ -812,6 +812,145 @@ public class GlobalBalanceTaskAssignorTest {
     }
 
     /**
+     * Triplelift Workload Test with Worker Scaling Scenarios
+     * 
+     * Tests a Triplelift-specific workload through a series of scaling events:
+     * 1. Initial allocation with 7 workers
+     * 2. Scale up to 11 workers
+     * 3. Scale down to 9 workers
+     * 4. Scale down to 5 workers 
+     * 5. Scale up to 7 workers
+     */
+    @Test
+    public void testTripleliftWorkloadScaling() {
+        logContext = new LogContext();
+        time = new MockTime();
+        configState = createTripleliftConfigState();
+        
+        GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
+        assignor.configSnapshot = configState;
+
+        // Calculate total tasks (each connector has multiple tasks based on its configuration)
+        int totalTaskCount = 0;
+        for (String connector : configState.connectors()) {
+            totalTaskCount += configState.taskCount(connector);
+        }
+        
+        log.info("Triplelift workload: {} connectors, {} total tasks", configState.connectors().size(), totalTaskCount);
+
+        // Step 1: Initial allocation with 7 workers
+        log.info("=== Step 1: Triplelift Initial Allocation (7 workers) ===");
+        Map<String, ConnectorsAndTasks> step1Assignments = new HashMap<>();
+        for (int i = 1; i <= 7; i++) {
+            step1Assignments.put("W" + i, new ConnectorsAndTasks.Builder().build());
+        }
+
+        ClusterAssignment step1Result = assignor.performTaskAssignment(
+                configState, 0, 1, step1Assignments);
+        
+        // Verify initial allocation balance
+        verifyGlobalBalance(step1Result.allAssignedTasks(), 7, totalTaskCount);
+        verifyPerConsumerBalance(step1Result.allAssignedTasks(), assignor);
+        log.info("✓ Step 1 PASSED: Initial allocation with 7 workers balanced");
+
+        // Step 2: Scale up to 11 workers
+        log.info("=== Step 2: Triplelift Scale Up (7→11 workers) ===");
+        Map<String, ConnectorsAndTasks> step2Assignments = new HashMap<>();
+        
+        // Preserve existing worker assignments
+        for (int i = 1; i <= 7; i++) {
+            String workerId = "W" + i;
+            Collection<String> workerConnectors = step1Result.allAssignedConnectors().get(workerId);
+            Collection<ConnectorTaskId> workerTasks = step1Result.allAssignedTasks().get(workerId);
+            step2Assignments.put(workerId, new ConnectorsAndTasks.Builder()
+                    .with(workerConnectors, workerTasks).build());
+        }
+        
+        // Add new workers
+        for (int i = 8; i <= 11; i++) {
+            step2Assignments.put("W" + i, new ConnectorsAndTasks.Builder().build());
+        }
+
+        ClusterAssignment step2Result = assignor.performTaskAssignment(
+                configState, 1, 2, step2Assignments);
+        
+        // Verify scale-up balance
+        verifyGlobalBalance(step2Result.allAssignedTasks(), 11, totalTaskCount);
+        verifyPerConsumerBalance(step2Result.allAssignedTasks(), assignor);
+        log.info("✓ Step 2 PASSED: Scale up to 11 workers balanced");
+
+        // Step 3: Scale down to 9 workers (remove W10, W11)
+        log.info("=== Step 3: Triplelift Scale Down (11→9 workers) ===");
+        Map<String, ConnectorsAndTasks> step3Assignments = new HashMap<>();
+        
+        // Preserve existing worker assignments for remaining workers
+        for (int i = 1; i <= 9; i++) {
+            String workerId = "W" + i;
+            Collection<String> workerConnectors = step2Result.allAssignedConnectors().get(workerId);
+            Collection<ConnectorTaskId> workerTasks = step2Result.allAssignedTasks().get(workerId);
+            step3Assignments.put(workerId, new ConnectorsAndTasks.Builder()
+                    .with(workerConnectors, workerTasks).build());
+        }
+
+        ClusterAssignment step3Result = assignor.performTaskAssignment(
+                configState, 2, 3, step3Assignments);
+        
+        // Verify scale-down balance
+        verifyGlobalBalance(step3Result.allAssignedTasks(), 9, totalTaskCount);
+        verifyPerConsumerBalance(step3Result.allAssignedTasks(), assignor);
+        log.info("✓ Step 3 PASSED: Scale down to 9 workers balanced");
+
+        // Step 4: Scale down to 5 workers (remove W6-W9)
+        log.info("=== Step 4: Triplelift Scale Down (9→5 workers) ===");
+        Map<String, ConnectorsAndTasks> step4Assignments = new HashMap<>();
+        
+        // Preserve existing worker assignments for remaining workers
+        for (int i = 1; i <= 5; i++) {
+            String workerId = "W" + i;
+            Collection<String> workerConnectors = step3Result.allAssignedConnectors().get(workerId);
+            Collection<ConnectorTaskId> workerTasks = step3Result.allAssignedTasks().get(workerId);
+            step4Assignments.put(workerId, new ConnectorsAndTasks.Builder()
+                    .with(workerConnectors, workerTasks).build());
+        }
+
+        ClusterAssignment step4Result = assignor.performTaskAssignment(
+                configState, 3, 4, step4Assignments);
+        
+        // Verify scale-down balance
+        verifyGlobalBalance(step4Result.allAssignedTasks(), 5, totalTaskCount);
+        verifyPerConsumerBalance(step4Result.allAssignedTasks(), assignor);
+        log.info("✓ Step 4 PASSED: Scale down to 5 workers balanced");
+
+        // Step 5: Scale up to 7 workers (add W6, W7)
+        log.info("=== Step 5: Triplelift Scale Up (5→7 workers) ===");
+        Map<String, ConnectorsAndTasks> step5Assignments = new HashMap<>();
+        
+        // Preserve existing worker assignments
+        for (int i = 1; i <= 5; i++) {
+            String workerId = "W" + i;
+            Collection<String> workerConnectors = step4Result.allAssignedConnectors().get(workerId);
+            Collection<ConnectorTaskId> workerTasks = step4Result.allAssignedTasks().get(workerId);
+            step5Assignments.put(workerId, new ConnectorsAndTasks.Builder()
+                    .with(workerConnectors, workerTasks).build());
+        }
+        
+        // Add new workers
+        for (int i = 6; i <= 7; i++) {
+            step5Assignments.put("W" + i, new ConnectorsAndTasks.Builder().build());
+        }
+
+        ClusterAssignment step5Result = assignor.performTaskAssignment(
+                configState, 4, 5, step5Assignments);
+        
+        // Verify scale-up balance
+        verifyGlobalBalance(step5Result.allAssignedTasks(), 7, totalTaskCount);
+        verifyPerConsumerBalance(step5Result.allAssignedTasks(), assignor);
+        log.info("✓ Step 5 PASSED: Scale up to 7 workers balanced");
+        
+        log.info("✓✓ All Triplelift Workload Tests PASSED: Balance maintained through all scaling events");
+    }
+
+    /**
      * Helper method to verify global balance requirements.
      */
     private void verifyGlobalBalance(Map<String, Collection<ConnectorTaskId>> taskAssignments, 
@@ -834,6 +973,98 @@ public class GlobalBalanceTaskAssignorTest {
                       expectedTasksPerWorker + " ± 1", 
                       Math.abs(workerTasks - expectedTasksPerWorker) <= 1);
         }
+    }
+
+    /**
+     * Helper method to create Triplelift workload configuration
+     * - 15 connectors
+     * - 1 connector with 124 tasks
+     * - 1 connector with 82 tasks
+     * - 1 connector with 44 tasks
+     * - 3 connector with 21 tasks
+     * - 3 connector with 6 tasks
+     * - 3 connectors with 3 tasks
+     * - 3 connectors with 1 task
+     * 
+     * Total: 340 tasks
+     */
+    private ClusterConfigState createTripleliftConfigState() {
+        Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
+        Map<String, Integer> taskCounts = new HashMap<>();
+
+        // 1 connector with 124 tasks
+        Map<String, String> connector1Config = new HashMap<>();
+        connector1Config.put("name", "TL1-connector");
+        connector1Config.put("tasks.max", "124");
+        connectorConfigs.put("TL1-connector", connector1Config);
+        taskCounts.put("TL1-connector", 124);
+        
+        // 1 connector with 82 tasks
+        Map<String, String> connector2Config = new HashMap<>();
+        connector2Config.put("name", "TL2-connector");
+        connector2Config.put("tasks.max", "82");
+        connectorConfigs.put("TL2-connector", connector2Config);
+        taskCounts.put("TL2-connector", 82);
+        
+        // 1 connector with 44 tasks
+        Map<String, String> connector3Config = new HashMap<>();
+        connector3Config.put("name", "TL3-connector");
+        connector3Config.put("tasks.max", "44");
+        connectorConfigs.put("TL3-connector", connector3Config);
+        taskCounts.put("TL3-connector", 44);
+        
+        // 3 connectors with 21 tasks each
+        for (int i = 1; i <= 3; i++) {
+            Map<String, String> config = new HashMap<>();
+            String connectorName = "TL4-connector" + i;
+            config.put("name", connectorName);
+            config.put("tasks.max", "21");
+            connectorConfigs.put(connectorName, config);
+            taskCounts.put(connectorName, 21);
+        }
+        
+        // 3 connectors with 6 tasks each
+        for (int i = 1; i <= 3; i++) {
+            Map<String, String> config = new HashMap<>();
+            String connectorName = "TL5-connector" + i;
+            config.put("name", connectorName);
+            config.put("tasks.max", "6");
+            connectorConfigs.put(connectorName, config);
+            taskCounts.put(connectorName, 6);
+        }
+        
+        // 3 connectors with 3 tasks each
+        for (int i = 1; i <= 3; i++) {
+            Map<String, String> config = new HashMap<>();
+            String connectorName = "TL6-connector" + i;
+            config.put("name", connectorName);
+            config.put("tasks.max", "3");
+            connectorConfigs.put(connectorName, config);
+            taskCounts.put(connectorName, 3);
+        }
+        
+        // 3 connectors with 1 task each
+        for (int i = 1; i <= 3; i++) {
+            Map<String, String> config = new HashMap<>();
+            String connectorName = "TL7-connector" + i;
+            config.put("name", connectorName);
+            config.put("tasks.max", "1");
+            connectorConfigs.put(connectorName, config);
+            taskCounts.put(connectorName, 1);
+        }
+        
+        return new ClusterConfigState(
+                1L,
+                null,
+                taskCounts,
+                connectorConfigs,
+                Collections.emptyMap(),
+                Collections.emptyMap(),
+                Collections.emptyMap(),
+                Collections.emptyMap(),
+                Collections.emptySet(),
+                Collections.emptySet()
+        );
     }
 
     /**
