@@ -1320,9 +1320,11 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
         WORKER_CHANGED,
 
         /**  
-        SCENARIO: Catch All Scenario 
-        Consumer group changes, configuration changes and other unhandled scenarios.
-            - Trigger Incremental Cooperative Rebalance
+        SCENARIO: Catch all logic as well as for configuration changes or redeployment event for existing consumer groups.
+            - Check if tasks are balanced across all workers consumers and tasks or not.
+            - Only trigger a rebalance if balance requirements are violated
+                - Per-Consumer Balance: Task count difference across workers ≤ 1 for each consumer group
+                - Global Balance: Total task count difference across workers ≤ 1
         **/
         OTHER
     }
