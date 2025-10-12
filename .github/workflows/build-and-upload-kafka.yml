@@ -51,7 +51,7 @@ jobs:
 
       - name: Upload Kafka libraries to S3
         run: |
-          VERSION=3.2.6-tl
+          VERSION=3.6.2-tl
           S3_BASE_LOCATION=s3://ops.triplelift.net/public/kafka/${VERSION}
           
           # Create a temporary directory for unique jars
