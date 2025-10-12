@@ -157,8 +157,7 @@ Worker scale up event where 3 new nodes are added to the cluster (W4, W5, W6).
 - Revoke and move only the minimum required number of tasks to create balanced distribution
 
 ### Before State
-3 Workers (W1-W3) from Scenario 3.
-
+3 Workers (W1-W3) from Scenario 2.
 ### After State: 6 Workers (W1-W6)
 
 **Workers Added:** W4, W5, W6
