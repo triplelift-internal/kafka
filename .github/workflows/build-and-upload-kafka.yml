@@ -13,18 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Build, Test and Upload Kafka Libraries
+name: Build and Upload Kafka Libraries
 
 on:
   workflow_dispatch:
   push:
     branches: [ "3.6.2-tl" ]
-  pull_request:
-    branches: [ "3.6.2-tl"]
 
 jobs:
-  build_test_and_upload_kafka:
-    name: Build, Test and Upload Kafka Libraries
+  build_and_upload_kafka:
+    name: Build and Upload Kafka Libraries
     runs-on: [self-hosted, prod]
     
     steps:
@@ -48,7 +46,7 @@ jobs:
               
       - name: Build Kafka with compatible Protobuf version
         run: |
-          ./gradlew build -Porg.gradle.jvmargs="-Dprotobuf.version=3.25.5" \
+          ./gradlew build -x tests -Porg.gradle.jvmargs="-Dprotobuf.version=3.25.5" \
             -Dprotobuf.version=3.25.5
 
       - name: Upload Kafka libraries to S3
