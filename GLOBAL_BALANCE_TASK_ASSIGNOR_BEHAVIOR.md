@@ -83,7 +83,7 @@ No tasks assigned.
 - C6: [1, 1, 1, 0, 1] ✓
 - C7: [1, 0, 0, 1, 1] ✓
 - C8: [0, 1, 1, 1, 0] ✓
-- C1-C8: Single task, difference ≤ 1 ✓
+- C9-C14: Single task, difference ≤ 1 ✓
 
 All consumers have maximum difference of 1 task across workers.
 
@@ -134,7 +134,7 @@ Worker scale down event where 2 nodes are removed from the cluster (W4 and W5).
 - C6: [1, 1, 2] (diff=1) ✓
 - C7: [1, 1, 1] (diff=0) ✓
 - C8: [1, 1, 1] (diff=0) ✓
-- C1-C8: Single task, difference ≤ 1 ✓
+- C9-C14: Single task, difference ≤ 1 ✓
 
 All consumers maintain maximum difference of 1 task across workers.
 
@@ -194,7 +194,7 @@ Worker scale up event where 3 new nodes are added to the cluster (W4, W5, W6).
 - C6: [0, 0, 1, 1, 1, 1] (diff=1) ✓
 - C7: [1, 1, 1, 0, 0, 0] (diff=1) ✓
 - C8: [0, 0, 0, 1, 1, 1] (diff=1) ✓
-- C1-C8: Single task, difference ≤ 1 ✓
+- C9-C14: Single task, difference ≤ 1 ✓
 
 All consumers maintain maximum difference of 1 task across workers.
 
@@ -206,7 +206,7 @@ All consumers maintain maximum difference of 1 task across workers.
 - C3 (7 tasks): Rebalanced from [3, 2, 2, 0, 0, 0] to [1, 1, 1, 1, 1, 2]
 
 **Consumers Not Requiring Rebalance (task count ≤ 6):**
-- C4-C8: Tasks redistributed to achieve global balance
+- C4-C14: Tasks redistributed to achieve global balance
 
 Rebalancing prioritizes consumers with highest task counts (C1 → C2 → C3) to minimize disruption while ensuring both per-consumer and global balance constraints are satisfied.
 
