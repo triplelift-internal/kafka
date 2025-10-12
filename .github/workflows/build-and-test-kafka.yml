@@ -23,7 +23,7 @@ on:
 jobs:
   build_test_and_upload_kafka:
     name: Build, Test and Upload Kafka Libraries
-    runs-on: [self-hosted, prod]
+    runs-on: ubuntu-latest
     
     steps:
       - name: Checkout repository
