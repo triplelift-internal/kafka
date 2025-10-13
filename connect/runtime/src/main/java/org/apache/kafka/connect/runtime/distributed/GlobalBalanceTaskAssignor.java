@@ -273,7 +273,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             Map<String, ConnectorsAndTasks> memberAssignments
     ) {
         log.info("Performing global balance task assignment for generation {}", currentGenerationId);
-        log.error("GlobalBalanceTaskAssignor: Performing global balance task assignment for generation {}", currentGenerationId);
+        log.error("INFO GlobalBalanceTaskAssignor: Performing global balance task assignment for generation {}", currentGenerationId);
 
 
         this.configSnapshot = configSnapshot;
@@ -287,7 +287,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
         GlobalBalanceTaskAssignorScenarioType balanceScenarioType = getTypeOfTaskBalanceScenario(
                 memberAssignments, configuredConnectors, configuredTasks);
         log.info("Detected balance scenario type: {}", balanceScenarioType);
-        log.error("GlobalBalanceTaskAssignor: Detected balance scenario type: {}", balanceScenarioType);
+        log.error("INFO GlobalBalanceTaskAssignor: Detected balance scenario type: {}", balanceScenarioType);
 
 
         List<WorkerLoad> workerLoads = memberAssignments.entrySet().stream()
@@ -323,7 +323,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             Set<ConnectorTaskId> configuredTasks) {
         
         log.info("Handling initial connector allocation scenario");
-        log.error("GlobalBalanceTaskAssignor: Handling initial connector allocation scenario");
+        log.error("INFO GlobalBalanceTaskAssignor: Handling initial connector allocation scenario");
 
         // Determine if this is a completely empty cluster or new consumer groups being added
         boolean isCompletelyEmptyCluster = memberAssignments.values().stream()

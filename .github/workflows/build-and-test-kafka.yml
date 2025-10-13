@@ -44,7 +44,11 @@ jobs:
       - name: Clean build directory
         run: ./gradlew clean
               
-      - name: Build Kafka with compatible Protobuf version
+      - name: Build Kafka with compatible Protobuf version and skip all tests
         run: |
-          ./gradlew build -Porg.gradle.jvmargs="-Dprotobuf.version=3.25.5" \
+          ./gradlew build -x test -Porg.gradle.jvmargs="-Dprotobuf.version=3.25.5" \
             -Dprotobuf.version=3.25.5
+
+      - name: Run Kafka Connect Tests
+        run: |
+          ./gradlew :connect:runtime:test

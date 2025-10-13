@@ -187,10 +187,11 @@ public class DistributedConfig extends WorkerConfig {
      */
     public static final String ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_CONFIG = "enable.global.balance.task.assignor";
     public static final String ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DOC = "Enable the global balance task assignor "
-             "which ensures strict per-consumer and global balance requirements: "
-             "1) Task count difference across workers <= 1 for each consumer group; "
-             "2) Total task count difference across workers <= 1. "
-             "When enabled, this assignor provides better load distribution compared to the default incremental cooperative assignor.";
+            + "which ensures strict per-consumer and global balance requirements: "
+            + "1) Task count difference across workers <= 1 for each consumer group; "
+            + "2) Total task count difference across workers <= 1. "
+            + "When enabled, this assignor provides better balanced load distribution compared to the default incremental cooperative assignor."
+            + "This is true for large workloads running on autoscaled clusters where the number of workers changes frequently or the worker count changes with load throughput.";
     public static final boolean ENABLE_GLOBAL_BALANCE_TASK_ASSIGNOR_DEFAULT = false;
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
