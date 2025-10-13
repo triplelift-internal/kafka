@@ -986,7 +986,7 @@ public class GlobalBalanceTaskAssignorTest {
      * - 3 connectors with 3 tasks
      * - 3 connectors with 1 task
      * 
-     * Total: 340 tasks
+     * Total: 343 tasks
      */
     private ClusterConfigState createTripleliftConfigState() {
         Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
