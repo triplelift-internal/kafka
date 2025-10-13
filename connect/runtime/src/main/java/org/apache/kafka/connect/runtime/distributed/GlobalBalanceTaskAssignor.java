@@ -36,6 +36,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
+import org.apache.kafka.connect.runtime.ConnectorConfig;
 
 /**
  * An assignor that extends the IncrementalCooperativeAssignor to provide global balance task assignment.
@@ -179,7 +180,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
                 }
             }
         }
-        return 1; // Default value from ConnectorConfig.TASKS_MAX_DEFAULT
+        return ConnectorConfig.TASKS_MAX_DEFAULT;
     }
 
     /**

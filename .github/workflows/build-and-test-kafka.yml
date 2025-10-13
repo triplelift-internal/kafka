@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Build, Test and Upload Kafka Libraries
+name: Build and Test Kafka
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ on:
 
 jobs:
   build_test_and_upload_kafka:
-    name: Build, Test and Upload Kafka Libraries
+    name: Build and Test Kafka
     runs-on: ubuntu-latest
     
     steps:
