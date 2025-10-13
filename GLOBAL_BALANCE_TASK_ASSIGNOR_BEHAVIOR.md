@@ -16,7 +16,7 @@ limitations under the License.
 -->
 # Kafka Connect Distributed Mode - Global Balance Task Assignor Behavior
 
-This document describes task allocation behavior for Kafka Connect in distributed mode across 4 scenarios, demonstrating worker-to-task assignments with strict balance requirements. The number of Workers, Consumer Groups and Tasks for those Consumer Groups are an example. The acutal behavior for GlobalBalanceTaskAssignor should be capable of handling any number of Workers, Consumer Groups and Tasks.
+This document describes task allocation behavior for Kafka Connect in distributed mode across 4 scenarios, demonstrating worker-to-task assignments with strict balance requirements. The number of Workers, Consumer Groups and Tasks for those Consumer Groups are an example. The actual behavior for GlobalBalanceTaskAssignor should be capable of handling any number of Workers, Consumer Groups and Tasks.
 
 ## Balance Requirements
 
@@ -157,8 +157,7 @@ Worker scale up event where 3 new nodes are added to the cluster (W4, W5, W6).
 - Revoke and move only the minimum required number of tasks to create balanced distribution
 
 ### Before State
-3 Workers (W1-W3) from Scenario 3.
-
+3 Workers (W1-W3) from Scenario 2.
 ### After State: 6 Workers (W1-W6)
 
 **Workers Added:** W4, W5, W6
