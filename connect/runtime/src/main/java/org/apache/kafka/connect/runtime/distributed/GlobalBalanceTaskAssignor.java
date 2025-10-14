@@ -164,6 +164,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
     /**
      * Gets the maximum number of tasks configured for a connector.
      * Defaults to 1 if not specified or configuration is not available.
+     * Always uses the latest configSnapshot to get the current config.
      */
     protected int getTasksMaxForConnector(String connectorName) {
         if (configSnapshot != null) {
@@ -273,10 +274,12 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             Map<String, ConnectorsAndTasks> memberAssignments
     ) {
         log.info("Performing global balance task assignment for generation {}", currentGenerationId);
-        log.error("INFO GlobalBalanceTaskAssignor: Performing global balance task assignment for generation {}", currentGenerationId);
+        log.info("INFO GlobalBalanceTaskAssignor: Performing global balance task assignment for generation {}", currentGenerationId);
 
-
+        // Store the latest config snapshot for use by all methods during this assignment round
         this.configSnapshot = configSnapshot;
+        
+        // Initialize configuration state with connectors and tasks
         Set<String> configuredConnectors = new TreeSet<>(configSnapshot.connectors());
         Set<ConnectorTaskId> configuredTasks = configuredConnectors.stream()
                 .flatMap(connector -> configSnapshot.tasks(connector).stream())
@@ -287,7 +290,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
         GlobalBalanceTaskAssignorScenarioType balanceScenarioType = getTypeOfTaskBalanceScenario(
                 memberAssignments, configuredConnectors, configuredTasks);
         log.info("Detected balance scenario type: {}", balanceScenarioType);
-        log.error("INFO GlobalBalanceTaskAssignor: Detected balance scenario type: {}", balanceScenarioType);
+        log.info("INFO GlobalBalanceTaskAssignor: Detected balance scenario type: {}", balanceScenarioType);
 
 
         List<WorkerLoad> workerLoads = memberAssignments.entrySet().stream()
@@ -323,7 +326,7 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             Set<ConnectorTaskId> configuredTasks) {
         
         log.info("Handling initial connector allocation scenario");
-        log.error("INFO GlobalBalanceTaskAssignor: Handling initial connector allocation scenario");
+        log.info("INFO GlobalBalanceTaskAssignor: Handling initial connector allocation scenario");
 
         // Determine if this is a completely empty cluster or new consumer groups being added
         boolean isCompletelyEmptyCluster = memberAssignments.values().stream()
@@ -843,19 +846,62 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             Set<String> configuredConnectors,
             Set<ConnectorTaskId> configuredTasks) {
         
-        log.info("Handling other scenario - checking if current assignment is already balanced");
+        log.info("Handling other scenario - checking for config changes and if current assignment is already balanced");
 
         Set<String> currentMembers = memberAssignments.keySet();
-
-        // Step 1: Check if current assignment is balanced
-        // Create WorkerLoad objects from current assignments to analyze balance
+        
+        // Step 1: Identify any configuration changes that need rebalancing
+        // Get currently active assignments across all workers
+        ConnectorsAndTasks activeAssignments = new ConnectorsAndTasks.Builder()
+                .with(
+                    memberAssignments.values().stream().flatMap(a -> a.connectors().stream()).collect(Collectors.toSet()),
+                    memberAssignments.values().stream().flatMap(a -> a.tasks().stream()).collect(Collectors.toSet())
+                ).build();
+        
+        // Find connectors with mismatched task counts (config changes)
+        Set<String> connectorsNeedingRebalance = configuredConnectors.stream()
+                .filter(connector -> {
+                    int configuredTaskCount = configSnapshot.tasks(connector).size();
+                    int activeTaskCount = (int) activeAssignments.tasks().stream()
+                            .filter(task -> task.connector().equals(connector))
+                            .count();
+                    
+                    if (configuredTaskCount != activeTaskCount) {
+                        log.debug("Connector {} needs rebalance: configured tasks = {}, active tasks = {}", 
+                                  connector, configuredTaskCount, activeTaskCount);
+                        return true;
+                    }
+                    return false;
+                })
+                .collect(Collectors.toSet());
+        
+        // Step 2: Handle config changes if any were found
+        if (!connectorsNeedingRebalance.isEmpty()) {
+            log.info("Configuration changes detected for {} connectors: {}", 
+                    connectorsNeedingRebalance.size(), connectorsNeedingRebalance);
+            
+            // Get the tasks that need to be rebalanced
+            Set<ConnectorTaskId> tasksToRebalance = configuredTasks.stream()
+                    .filter(task -> connectorsNeedingRebalance.contains(task.connector()))
+                    .collect(Collectors.toSet());
+                    
+            return performRebalanceForConnectors(
+                    memberAssignments, 
+                    currentMembers, 
+                    connectorsNeedingRebalance, 
+                    tasksToRebalance,
+                    configuredTasks);
+        }
+        
+        // Step 3: If no config changes, check balance requirements
+        // Convert member assignments to worker loads for balance checking
         List<WorkerLoad> currentWorkerLoads = memberAssignments.entrySet().stream()
                 .map(entry -> new WorkerLoad.Builder(entry.getKey())
                         .with(entry.getValue().connectors(), entry.getValue().tasks())
                         .build())
                 .collect(Collectors.toList());
         
-        // Check global balance: total tasks difference ≤ 1 across all workers
+        // Check 1: Global balance - task count difference ≤ 1 across all workers
         int minGlobalLoad = currentWorkerLoads.stream().mapToInt(w -> w.tasks().size()).min().orElse(0);
         int maxGlobalLoad = currentWorkerLoads.stream().mapToInt(w -> w.tasks().size()).max().orElse(0);
         boolean globalBalanceViolated = (maxGlobalLoad - minGlobalLoad) > 1;
@@ -863,52 +909,15 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
         log.debug("Global balance check: min={}, max={}, difference={}, balanced={}", 
                 minGlobalLoad, maxGlobalLoad, maxGlobalLoad - minGlobalLoad, !globalBalanceViolated);
         
-        // Check per-consumer balance: task count difference ≤ 1 for each consumer group
-        boolean perConsumerBalanceViolated = false;
+        // Check 2: Per-consumer balance - task count difference ≤ 1 per consumer
+        // Build task counts by consumer and worker
+        Map<String, Map<String, Integer>> taskCountByConsumerAndWorker = buildTaskCountMap(currentWorkerLoads);
         
-        // Group tasks by consumer for balance checking
-        Map<String, Map<String, Integer>> taskCountByConsumerAndWorker = new HashMap<>();
+        // Find consumers with unbalanced task distribution
+        Set<String> unbalancedConsumers = findUnbalancedConsumers(taskCountByConsumerAndWorker);
+        boolean perConsumerBalanceViolated = !unbalancedConsumers.isEmpty();
         
-        // Initialize counts for each worker and consumer
-        for (WorkerLoad worker : currentWorkerLoads) {
-            String workerId = worker.worker();
-            
-            for (ConnectorTaskId task : worker.tasks()) {
-                String consumer = extractConsumerFromConnector(task.connector());
-                
-                // Initialize consumer map if not present
-                taskCountByConsumerAndWorker.computeIfAbsent(consumer, k -> new HashMap<>());
-                
-                // Initialize worker count for this consumer if not present
-                Map<String, Integer> workerCounts = taskCountByConsumerAndWorker.get(consumer);
-                workerCounts.put(workerId, workerCounts.getOrDefault(workerId, 0) + 1);
-            }
-        }
-        
-        // Ensure all workers have entries for all consumers (with count 0 if no tasks)
-        for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
-            Map<String, Integer> workerCounts = entry.getValue();
-            for (WorkerLoad worker : currentWorkerLoads) {
-                workerCounts.putIfAbsent(worker.worker(), 0);
-            }
-        }
-        
-        // Check balance for each consumer
-        for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
-            String consumer = entry.getKey();
-            Map<String, Integer> workerCounts = entry.getValue();
-            int minCount = Collections.min(workerCounts.values());
-            int maxCount = Collections.max(workerCounts.values());
-            
-            if ((maxCount - minCount) > 1) {
-                log.debug("Per-consumer balance violation for consumer {}: min={}, max={}, difference={}", 
-                        consumer, minCount, maxCount, maxCount - minCount);
-                perConsumerBalanceViolated = true;
-                break;
-            }
-        }
-        
-        // If both global and per-consumer balance requirements are met, no rebalancing needed
+        // Step 4: If both balance requirements are met, no rebalancing needed
         if (!globalBalanceViolated && !perConsumerBalanceViolated) {
             log.info("Current assignment is already balanced. No rebalancing needed.");
             
@@ -938,277 +947,299 @@ public class GlobalBalanceTaskAssignor extends IncrementalCooperativeAssignor {
             );
         }
         
-        // If we reach here, balance is violated and rebalancing is needed
-        log.info("Balance requirements violated. Performing selective rebalance only for unbalanced consumer groups.");
+        // Step 5: Balance is violated, identify which consumers to rebalance
+        log.info("Balance requirements violated. Performing selective rebalance.");
         log.debug("Global balance violated: {}, Per-consumer balance violated: {}", 
                 globalBalanceViolated, perConsumerBalanceViolated);
         
-        // Identify which consumer groups have violated the balance constraint
-        Set<String> unbalancedConsumers = new HashSet<>();
-        
-        // Check per-consumer balance violations
-        for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
-            String consumer = entry.getKey();
-            Map<String, Integer> workerCounts = entry.getValue();
-            int minCount = Collections.min(workerCounts.values());
-            int maxCount = Collections.max(workerCounts.values());
-            
-            if ((maxCount - minCount) > 1) {
-                unbalancedConsumers.add(consumer);
-                log.debug("Consumer {} is unbalanced: min={}, max={}, difference={}", 
-                        consumer, minCount, maxCount, maxCount - minCount);
-            }
-        }
-        
-        // If only global balance is violated but no specific consumer is unbalanced,
-        // we need to do some targeted redistribution from low-load consumers
+        // If no per-consumer violations but global balance violated,
+        // we need to identify which consumers to move for load balancing
         if (globalBalanceViolated && unbalancedConsumers.isEmpty()) {
-            log.debug("Only global balance is violated, identifying low-load consumers for targeted rebalancing");
-            
-            // Get workers sorted by load (highest first and lowest last)
-            List<WorkerLoad> workersSortedByLoad = currentWorkerLoads.stream()
-                    .sorted(Comparator.comparingInt((WorkerLoad w) -> w.tasks().size()).reversed())
-                    .collect(Collectors.toList());
-            
-            // Get the highest and lowest loaded workers
-            WorkerLoad highestLoadedWorker = workersSortedByLoad.get(0);
-            WorkerLoad lowestLoadedWorker = workersSortedByLoad.get(workersSortedByLoad.size() - 1);
-            
-            int maxTasks = highestLoadedWorker.tasks().size();
-            int minTasks = lowestLoadedWorker.tasks().size();
-            int currentWorkerCount = currentWorkerLoads.size();
-            
-            log.debug("Highest loaded worker: {} with {} tasks, lowest loaded worker: {} with {} tasks", 
-                    highestLoadedWorker.worker(), maxTasks, lowestLoadedWorker.worker(), minTasks);
-            
-            // Calculate task count for each consumer group
-            Map<String, Integer> consumerTaskCounts = new HashMap<>();
-            Map<String, Integer> consumerTasksMax = new HashMap<>();
-            
-            for (String connector : configuredConnectors) {
-                String consumer = extractConsumerFromConnector(connector);
-                consumerTasksMax.computeIfAbsent(consumer, k -> getTasksMaxForConnector(connector));
-            }
-            
-            for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
-                String consumer = entry.getKey();
-                Map<String, Integer> workerCounts = entry.getValue();
-                int totalTasks = workerCounts.values().stream()
-                        .mapToInt(Integer::intValue).sum();
-                consumerTaskCounts.put(consumer, totalTasks);
-            }
-            
-            // Sort consumers by task count (ascending - lowest task count first)
-            List<String> sortedConsumersByTaskCount = consumerTaskCounts.entrySet().stream()
-                    .sorted((e1, e2) -> {
-                        String c1 = e1.getKey();
-                        String c2 = e2.getKey();
-                        int count1 = e1.getValue();
-                        int count2 = e2.getValue();
-                        
-                        // Primary sort: consumers with task.max < workerCount come first
-                        boolean c1SmallerThanWorkers = consumerTasksMax.getOrDefault(c1, 1) < currentWorkerCount;
-                        boolean c2SmallerThanWorkers = consumerTasksMax.getOrDefault(c2, 1) < currentWorkerCount;
-                        
-                        if (c1SmallerThanWorkers != c2SmallerThanWorkers) {
-                            return c1SmallerThanWorkers ? -1 : 1;
-                        }
-                        
-                        // Secondary sort: by task count (ascending)
-                        return Integer.compare(count1, count2);
-                    })
-                    .map(Map.Entry::getKey)
-                    .collect(Collectors.toList());
-            
-            // Identify which low-load consumers to move
-            for (String consumer : sortedConsumersByTaskCount) {
-                int tasksMax = consumerTasksMax.getOrDefault(consumer, 1);
-                
-                // Skip high-load consumers (task.max > worker count)
-                if (tasksMax >= currentWorkerCount) {
-                    log.debug("Skipping consumer {} with tasks.max={} >= worker count {}", 
-                            consumer, tasksMax, currentWorkerCount);
-                    continue;
-                }
-                
-                // Check if this consumer has more tasks on the highest loaded worker
-                // than on the lowest loaded worker
-                int tasksOnHighWorker = 0;
-                int tasksOnLowWorker = 0;
-                
-                if (taskCountByConsumerAndWorker.containsKey(consumer)) {
-                    Map<String, Integer> workerCounts = taskCountByConsumerAndWorker.get(consumer);
-                    tasksOnHighWorker = workerCounts.getOrDefault(highestLoadedWorker.worker(), 0);
-                    tasksOnLowWorker = workerCounts.getOrDefault(lowestLoadedWorker.worker(), 0);
-                }
-                
-                if (tasksOnHighWorker > tasksOnLowWorker) {
-                    unbalancedConsumers.add(consumer);
-                    log.debug("Adding low-load consumer {} with tasks.max={} to rebalance list (tasks on high={}, tasks on low={})", 
-                            consumer, tasksMax, tasksOnHighWorker, tasksOnLowWorker);
-                    
-                    // If we have enough consumers to rebalance, stop adding more
-                    if (maxTasks - minTasks <= unbalancedConsumers.size()) {
-                        break;
-                    }
-                }
-            }
-            
-            // If we still haven't found enough consumers to rebalance, try with consumers
-            // that have tasks.max < 2*workerCount as a fallback
-            if (unbalancedConsumers.isEmpty()) {
-                log.debug("No suitable low-load consumers found, trying consumers with tasks.max < 2*workerCount");
-                
-                for (String consumer : sortedConsumersByTaskCount) {
-                    int tasksMax = consumerTasksMax.getOrDefault(consumer, 1);
-                    
-                    // Only consider consumers with tasks.max < 2*workerCount
-                    if (tasksMax >= 2 * currentWorkerCount) {
-                        continue;
-                    }
-                    
-                    // Check if this consumer has tasks on the highest loaded worker
-                    if (taskCountByConsumerAndWorker.containsKey(consumer)) {
-                        Map<String, Integer> workerCounts = taskCountByConsumerAndWorker.get(consumer);
-                        int tasksOnHighWorker = workerCounts.getOrDefault(highestLoadedWorker.worker(), 0);
-                        
-                        if (tasksOnHighWorker > 0) {
-                            unbalancedConsumers.add(consumer);
-                            log.debug("Adding fallback consumer {} with tasks.max={} to rebalance list", 
-                                    consumer, tasksMax);
-                            break;
-                        }
-                    }
-                }
-            }
+            unbalancedConsumers = identifyConsumersForGlobalRebalance(
+                    currentWorkerLoads, 
+                    taskCountByConsumerAndWorker, 
+                    configuredConnectors);
         }
         
-        // Create new WorkerLoad objects that preserve current assignments
-        List<WorkerLoad> newWorkerLoads = currentMembers.stream()
-                .map(worker -> new WorkerLoad.Builder(worker).build())
-                .collect(Collectors.toList());
-                
-        // Filter connectors and tasks that belong to unbalanced consumers
-        Set<String> connectorsToRebalance = new HashSet<>();
-        Set<ConnectorTaskId> tasksToRebalance = new HashSet<>();
+        // Create a final copy for use in lambda expressions
+        final Set<String> finalUnbalancedConsumers = new HashSet<>(unbalancedConsumers);
         
-        // Identify connectors and tasks from unbalanced consumer groups
-        for (String connector : configuredConnectors) {
-            String consumer = extractConsumerFromConnector(connector);
-            if (unbalancedConsumers.contains(consumer)) {
-                connectorsToRebalance.add(connector);
-            }
-        }
+        // Get all connectors and tasks for the unbalanced consumers
+        Set<String> connectorsToRebalance = configuredConnectors.stream()
+                .filter(connector -> finalUnbalancedConsumers.contains(extractConsumerFromConnector(connector)))
+                .collect(Collectors.toSet());
         
-        for (ConnectorTaskId task : configuredTasks) {
-            String consumer = extractConsumerFromConnector(task.connector());
-            if (unbalancedConsumers.contains(consumer)) {
-                tasksToRebalance.add(task);
-            }
-        }
+        Set<ConnectorTaskId> tasksToRebalance = configuredTasks.stream()
+                .filter(task -> finalUnbalancedConsumers.contains(extractConsumerFromConnector(task.connector())))
+                .collect(Collectors.toSet());
         
         log.debug("Selective rebalance will reassign {} connectors and {} tasks from {} unbalanced consumers", 
                 connectorsToRebalance.size(), tasksToRebalance.size(), unbalancedConsumers.size());
+                
+        return performRebalanceForConnectors(
+                memberAssignments, 
+                currentMembers, 
+                connectorsToRebalance, 
+                tasksToRebalance,
+                configuredTasks);
+    }
+    
+    /**
+     * Helper method to build a map of task counts by consumer and worker
+     */
+    private Map<String, Map<String, Integer>> buildTaskCountMap(List<WorkerLoad> workerLoads) {
+        Map<String, Map<String, Integer>> taskCountByConsumerAndWorker = new HashMap<>();
         
-        // Assign only the connectors and tasks from unbalanced consumers
-        assignConnectors(newWorkerLoads, connectorsToRebalance);
-        assignTasks(newWorkerLoads, tasksToRebalance);
-
-        // Build final assignments
-        Map<String, Collection<String>> finalConnectorAssignments = newWorkerLoads.stream()
-                .collect(Collectors.toMap(
-                        WorkerLoad::worker,
-                        WorkerLoad::connectors
-                ));
-
-        Map<String, Collection<ConnectorTaskId>> finalTaskAssignments = newWorkerLoads.stream()
-                .collect(Collectors.toMap(
-                        WorkerLoad::worker,
-                        WorkerLoad::tasks
-                ));
-
-        // Find connectors and tasks that changed assignment
-        Map<String, Collection<String>> newlyAssignedConnectors = new HashMap<>();
-        Map<String, Collection<ConnectorTaskId>> newlyAssignedTasks = new HashMap<>();
+        // Count tasks by consumer for each worker
+        for (WorkerLoad worker : workerLoads) {
+            String workerId = worker.worker();
+            
+            for (ConnectorTaskId task : worker.tasks()) {
+                String consumer = extractConsumerFromConnector(task.connector());
+                Map<String, Integer> workerCounts = taskCountByConsumerAndWorker
+                        .computeIfAbsent(consumer, k -> new HashMap<>());
+                workerCounts.put(workerId, workerCounts.getOrDefault(workerId, 0) + 1);
+            }
+        }
+        
+        // Ensure all workers have entries for all consumers (with count 0 if no tasks)
+        for (Map<String, Integer> workerCounts : taskCountByConsumerAndWorker.values()) {
+            for (WorkerLoad worker : workerLoads) {
+                workerCounts.putIfAbsent(worker.worker(), 0);
+            }
+        }
+        
+        return taskCountByConsumerAndWorker;
+    }
+    
+    /**
+     * Helper method to find consumers with unbalanced task distribution
+     */
+    private Set<String> findUnbalancedConsumers(Map<String, Map<String, Integer>> taskCountByConsumerAndWorker) {
+        Set<String> unbalancedConsumers = new HashSet<>();
+        
+        for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
+            String consumer = entry.getKey();
+            Map<String, Integer> workerCounts = entry.getValue();
+            
+            if (!workerCounts.isEmpty()) {
+                int minCount = Collections.min(workerCounts.values());
+                int maxCount = Collections.max(workerCounts.values());
+                
+                if ((maxCount - minCount) > 1) {
+                    log.debug("Per-consumer balance violation for consumer {}: min={}, max={}, difference={}", 
+                            consumer, minCount, maxCount, maxCount - minCount);
+                    unbalancedConsumers.add(consumer);
+                }
+            }
+        }
+        
+        return unbalancedConsumers;
+    }
+    
+    /**
+     * Helper method to identify which consumers to rebalance for global balance
+     */
+    private Set<String> identifyConsumersForGlobalRebalance(
+            List<WorkerLoad> workerLoads,
+            Map<String, Map<String, Integer>> taskCountByConsumerAndWorker,
+            Set<String> configuredConnectors) {
+        
+        log.debug("Only global balance is violated, identifying consumers for targeted rebalancing");
+        Set<String> consumers = new HashSet<>();
+        
+        // Sort workers by load (highest first)
+        List<WorkerLoad> sortedWorkers = workerLoads.stream()
+                .sorted(Comparator.comparingInt((WorkerLoad w) -> w.tasks().size()).reversed())
+                .collect(Collectors.toList());
+        
+        WorkerLoad highestLoadedWorker = sortedWorkers.get(0);
+        WorkerLoad lowestLoadedWorker = sortedWorkers.get(sortedWorkers.size() - 1);
+        int maxTasks = highestLoadedWorker.tasks().size();
+        int minTasks = lowestLoadedWorker.tasks().size();
+        int workerCount = workerLoads.size();
+        
+        log.debug("Highest loaded worker: {} with {} tasks, lowest loaded worker: {} with {} tasks", 
+                highestLoadedWorker.worker(), maxTasks, lowestLoadedWorker.worker(), minTasks);
+        
+        // Group connectors by consumer and count tasks per consumer
+        Map<String, Integer> consumerTaskCounts = new HashMap<>();
+        Map<String, Integer> consumerTasksMax = new HashMap<>();
+        
+        // Get tasks.max for each consumer
+        for (String connector : configuredConnectors) {
+            String consumer = extractConsumerFromConnector(connector);
+            consumerTasksMax.computeIfAbsent(consumer, k -> getTasksMaxForConnector(connector));
+        }
+        
+        // Count total tasks per consumer
+        for (Map.Entry<String, Map<String, Integer>> entry : taskCountByConsumerAndWorker.entrySet()) {
+            String consumer = entry.getKey();
+            int totalTasks = entry.getValue().values().stream().mapToInt(Integer::intValue).sum();
+            consumerTaskCounts.put(consumer, totalTasks);
+        }
+        
+        // Sort consumers by ascending task count and tasks.max < workerCount
+        List<String> sortedConsumers = consumerTaskCounts.entrySet().stream()
+                .sorted((e1, e2) -> {
+                    String c1 = e1.getKey();
+                    String c2 = e2.getKey();
+                    
+                    // Primary: prefer consumers with tasks.max < workerCount
+                    boolean c1Small = consumerTasksMax.getOrDefault(c1, 1) < workerCount;
+                    boolean c2Small = consumerTasksMax.getOrDefault(c2, 1) < workerCount;
+                    if (c1Small != c2Small) return c1Small ? -1 : 1;
+                    
+                    // Secondary: sort by task count ascending
+                    return Integer.compare(e1.getValue(), e2.getValue());
+                })
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+        
+        // Find suitable consumers to rebalance
+        for (String consumer : sortedConsumers) {
+            int tasksMax = consumerTasksMax.getOrDefault(consumer, 1);
+            
+            // Skip if tasks.max >= workerCount (these are high-load consumers)
+            if (tasksMax >= workerCount) continue;
+            
+            // Check if this consumer has more tasks on the highest loaded worker
+            // than on the lowest loaded worker
+            Map<String, Integer> workerCounts = taskCountByConsumerAndWorker.get(consumer);
+            if (workerCounts != null) {
+                int tasksOnHighWorker = workerCounts.getOrDefault(highestLoadedWorker.worker(), 0);
+                int tasksOnLowWorker = workerCounts.getOrDefault(lowestLoadedWorker.worker(), 0);
+                
+                if (tasksOnHighWorker > tasksOnLowWorker) {
+                    consumers.add(consumer);
+                    log.debug("Adding consumer {} for rebalance (tasks.max={}, tasks on high={}, tasks on low={})", 
+                            consumer, tasksMax, tasksOnHighWorker, tasksOnLowWorker);
+                    
+                    // Stop if we have enough consumers to fix the imbalance
+                    if (maxTasks - minTasks <= consumers.size()) break;
+                }
+            }
+        }
+        
+        // If we still need more consumers, try consumers with tasks.max < 2*workerCount
+        if (consumers.isEmpty()) {
+            for (String consumer : sortedConsumers) {
+                int tasksMax = consumerTasksMax.getOrDefault(consumer, 1);
+                if (tasksMax >= 2 * workerCount) continue;
+                
+                Map<String, Integer> workerCounts = taskCountByConsumerAndWorker.get(consumer);
+                if (workerCounts != null && workerCounts.getOrDefault(highestLoadedWorker.worker(), 0) > 0) {
+                    consumers.add(consumer);
+                    log.debug("Adding fallback consumer {} with tasks.max={}", consumer, tasksMax);
+                    break;
+                }
+            }
+        }
+        
+        return consumers;
+    }
+    
+    /**
+     * Helper method to perform rebalancing for a set of connectors and tasks
+     */
+    private ClusterAssignment performRebalanceForConnectors(
+            Map<String, ConnectorsAndTasks> memberAssignments,
+            Set<String> currentMembers,
+            Set<String> connectorsToRebalance,
+            Set<ConnectorTaskId> tasksToRebalance,
+            Set<ConnectorTaskId> allConfiguredTasks) {
+        
+        // 1. Create worker loads - excluding connectors & tasks to be rebalanced
+        List<WorkerLoad> workerLoads = memberAssignments.entrySet().stream()
+                .map(entry -> {
+                    String worker = entry.getKey();
+                    Collection<String> keptConnectors = entry.getValue().connectors().stream()
+                            .filter(c -> !connectorsToRebalance.contains(c))
+                            .collect(Collectors.toList());
+                    Collection<ConnectorTaskId> keptTasks = entry.getValue().tasks().stream()
+                            .filter(t -> !tasksToRebalance.contains(t))
+                            .collect(Collectors.toList());
+                    return new WorkerLoad.Builder(worker)
+                            .with(keptConnectors, keptTasks)
+                            .build();
+                })
+                .collect(Collectors.toList());
+        
+        // 2. Apply global balance assignment for connectors/tasks being rebalanced
+        assignConnectors(workerLoads, connectorsToRebalance);
+        assignTasks(workerLoads, tasksToRebalance);
+        
+        // 3. Calculate revoked resources (what each worker had but will lose)
         Map<String, Collection<String>> revokedConnectors = new HashMap<>();
         Map<String, Collection<ConnectorTaskId>> revokedTasks = new HashMap<>();
         
-        // Track current and new assignments for comparison
-        Map<String, Set<String>> currentConnectorsByWorker = new HashMap<>();
-        Map<String, Set<ConnectorTaskId>> currentTasksByWorker = new HashMap<>();
-        Map<String, Set<String>> newConnectorsByWorker = new HashMap<>();
-        Map<String, Set<ConnectorTaskId>> newTasksByWorker = new HashMap<>();
-        
-        // Populate current assignments
         for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
-            String workerId = entry.getKey();
-            currentConnectorsByWorker.put(workerId, new HashSet<>(entry.getValue().connectors()));
-            currentTasksByWorker.put(workerId, new HashSet<>(entry.getValue().tasks()));
+            String worker = entry.getKey();
+            
+            // Find connectors to revoke from this worker
+            Set<String> connectors = entry.getValue().connectors().stream()
+                    .filter(connectorsToRebalance::contains)
+                    .collect(Collectors.toSet());
+            if (!connectors.isEmpty()) {
+                revokedConnectors.put(worker, connectors);
+            }
+            
+            // Find tasks to revoke from this worker
+            Set<ConnectorTaskId> tasks = entry.getValue().tasks().stream()
+                    .filter(tasksToRebalance::contains)
+                    .collect(Collectors.toSet());
+            if (!tasks.isEmpty()) {
+                revokedTasks.put(worker, tasks);
+            }
         }
         
-        // Populate new assignments
-        for (WorkerLoad worker : newWorkerLoads) {
+        // 4. Calculate newly assigned resources and final assignments
+        Map<String, Collection<String>> finalConnectorAssignments = workerLoads.stream()
+                .collect(Collectors.toMap(WorkerLoad::worker, WorkerLoad::connectors));
+        
+        Map<String, Collection<ConnectorTaskId>> finalTaskAssignments = workerLoads.stream()
+                .collect(Collectors.toMap(WorkerLoad::worker, WorkerLoad::tasks));
+        
+        Map<String, Collection<String>> newlyAssignedConnectors = new HashMap<>();
+        Map<String, Collection<ConnectorTaskId>> newlyAssignedTasks = new HashMap<>();
+        
+        for (WorkerLoad worker : workerLoads) {
             String workerId = worker.worker();
-            newConnectorsByWorker.put(workerId, new HashSet<>(worker.connectors()));
-            newTasksByWorker.put(workerId, new HashSet<>(worker.tasks()));
-        }
-        
-        // Calculate revoked and newly assigned connectors and tasks
-        for (String workerId : currentMembers) {
-            Set<String> currentConnectors = currentConnectorsByWorker.getOrDefault(workerId, Collections.emptySet());
-            Set<String> newConnectors = newConnectorsByWorker.getOrDefault(workerId, Collections.emptySet());
-            Set<ConnectorTaskId> currentTasks = currentTasksByWorker.getOrDefault(workerId, Collections.emptySet());
-            Set<ConnectorTaskId> newTasks = newTasksByWorker.getOrDefault(workerId, Collections.emptySet());
             
-            // Find revoked (current - new)
-            Set<String> revoked = new HashSet<>(currentConnectors);
-            revoked.removeAll(newConnectors);
-            if (!revoked.isEmpty()) {
-                revokedConnectors.put(workerId, revoked);
+            // Find newly assigned connectors
+            Collection<String> newConnectors = worker.connectors().stream()
+                    .filter(connectorsToRebalance::contains)
+                    .collect(Collectors.toList());
+            if (!newConnectors.isEmpty()) {
+                newlyAssignedConnectors.put(workerId, newConnectors);
             }
             
-            Set<ConnectorTaskId> revokedT = new HashSet<>(currentTasks);
-            revokedT.removeAll(newTasks);
-            if (!revokedT.isEmpty()) {
-                revokedTasks.put(workerId, revokedT);
-            }
-            
-            // Find newly assigned (new - current)
-            Set<String> newlyAssigned = new HashSet<>(newConnectors);
-            newlyAssigned.removeAll(currentConnectors);
-            if (!newlyAssigned.isEmpty()) {
-                newlyAssignedConnectors.put(workerId, newlyAssigned);
-            }
-            
-            Set<ConnectorTaskId> newlyAssignedT = new HashSet<>(newTasks);
-            newlyAssignedT.removeAll(currentTasks);
-            if (!newlyAssignedT.isEmpty()) {
-                newlyAssignedTasks.put(workerId, newlyAssignedT);
+            // Find newly assigned tasks
+            Collection<ConnectorTaskId> newTasks = worker.tasks().stream()
+                    .filter(tasksToRebalance::contains)
+                    .collect(Collectors.toList());
+            if (!newTasks.isEmpty()) {
+                newlyAssignedTasks.put(workerId, newTasks);
             }
         }
-
-        log.debug("Selective rebalance complete - {} connectors and {} tasks reassigned across {} workers", 
-                connectorsToRebalance.size(), tasksToRebalance.size(), newWorkerLoads.size());
-
-        // Verify and log the balance achieved
-        //logBalanceVerification(newWorkerLoads, connectorsToRebalance, tasksToRebalance);
         
-        // Log rebalance results
-        int revoked = revokedTasks.values().stream().mapToInt(Collection::size).sum();
-        int assigned = newlyAssignedTasks.values().stream().mapToInt(Collection::size).sum();
-        log.info("Selective rebalance results: {} tasks revoked, {} tasks assigned", revoked, assigned);
-
+        // Log summary of rebalance
+        int revokedCount = revokedTasks.values().stream().mapToInt(Collection::size).sum();
+        int assignedCount = newlyAssignedTasks.values().stream().mapToInt(Collection::size).sum();
+        log.info("Rebalance complete: {} tasks revoked, {} tasks assigned", 
+                revokedCount, assignedCount);
+        
         // Update previousMembers for next rebalance cycle
         previousMembers = currentMembers;
-
-        // Return the cluster assignment for selective rebalance
+        
+        // Return the rebalanced cluster assignment
         return new ClusterAssignment(
-                newlyAssignedConnectors,    // only connectors that changed assignment
-                newlyAssignedTasks,         // only tasks that changed assignment
-                revokedConnectors,          // only revoked assignments 
-                revokedTasks,               // only revoked assignments
-                finalConnectorAssignments,  // final state after selective rebalance
-                finalTaskAssignments        // final state after selective rebalance
+                newlyAssignedConnectors,
+                newlyAssignedTasks,
+                revokedConnectors,
+                revokedTasks,
+                finalConnectorAssignments,
+                finalTaskAssignments
         );
     }
 
