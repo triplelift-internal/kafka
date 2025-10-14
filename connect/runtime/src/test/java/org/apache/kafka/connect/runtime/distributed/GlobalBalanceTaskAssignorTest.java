@@ -52,7 +52,7 @@ public class GlobalBalanceTaskAssignorTest {
     private ClusterConfigState createConfigState() {
         Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
         Map<String, Integer> taskCounts = new HashMap<>();
-        
+
         // C1: 18 tasks
         for (int i = 1; i <= 18; i++) {
             Map<String, String> config = new HashMap<>();
@@ -61,7 +61,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C1-connector" + i, config);
             taskCounts.put("C1-connector" + i, 1);  // Each connector has 1 task
         }
-        
+
         // C2: 11 tasks
         for (int i = 1; i <= 11; i++) {
             Map<String, String> config = new HashMap<>();
@@ -70,7 +70,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C2-connector" + i, config);
             taskCounts.put("C2-connector" + i, 1);  // Each connector has 1 task
         }
-        
+
         // C3: 7 tasks
         for (int i = 1; i <= 7; i++) {
             Map<String, String> config = new HashMap<>();
@@ -79,7 +79,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C3-connector" + i, config);
             taskCounts.put("C3-connector" + i, 1);  // Each connector has 1 task
         }
-        
+
         // C4, C5, C6: 4 tasks each
         for (String consumer : Arrays.asList("C4", "C5", "C6")) {
             for (int i = 1; i <= 4; i++) {
@@ -90,7 +90,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);  // Each connector has 1 task
             }
         }
-        
+
         // C7, C8: 3 tasks each
         for (String consumer : Arrays.asList("C7", "C8")) {
             for (int i = 1; i <= 3; i++) {
@@ -101,7 +101,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);  // Each connector has 1 task
             }
         }
-        
+
         // C9-C14: 1 task each
         for (String consumer : Arrays.asList("C9", "C10", "C11", "C12", "C13", "C14")) {
             Map<String, String> config = new HashMap<>();
@@ -110,7 +110,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(consumer + "-connector1", config);
             taskCounts.put(consumer + "-connector1", 1);  // Each connector has 1 task
         }
-        
+
         return new ClusterConfigState(
                 1L,
                 null,
@@ -127,7 +127,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Scenario 1: Initial Allocation (Starting Unassigned State)
-     * 
+     *
      * Tests the initial allocation of 60 tasks across 5 workers.
      * Expected: Each worker gets 12 tasks with global balance difference ≤ 1
      */
@@ -136,7 +136,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -154,7 +154,7 @@ public class GlobalBalanceTaskAssignorTest {
         }
 
         log.info("=== Scenario 1: Initial Allocation ===");
-        log.info("Total connectors: {}, Total tasks: {}, Workers: {}", 
+        log.info("Total connectors: {}, Total tasks: {}, Workers: {}",
                 connectors.size(), tasks.size(), workers.size());
 
         // Perform assignment
@@ -165,7 +165,7 @@ public class GlobalBalanceTaskAssignorTest {
         int totalAssignments = 0;
         int minLoad = Integer.MAX_VALUE;
         int maxLoad = 0;
-        
+
         Map<String, Integer> workerLoads = new HashMap<>();
         for (WorkerLoad worker : workers) {
             int workerLoad = worker.tasksSize(); // Only count tasks for balance
@@ -173,29 +173,29 @@ public class GlobalBalanceTaskAssignorTest {
             minLoad = Math.min(minLoad, workerLoad);
             maxLoad = Math.max(maxLoad, workerLoad);
             workerLoads.put(worker.worker(), workerLoad);
-            
-            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted", 
+
+            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted",
                     worker.worker(), worker.connectorsSize(), worker.tasksSize(), workerLoad);
         }
 
         // Assertions
         assertEquals("Total assignments mismatch", 60, totalAssignments);
-        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1", 
+        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1",
                    maxLoad - minLoad <= 1);
-        
+
         // Each worker should have 12 tasks (60/5)
         for (int load : workerLoads.values()) {
-            assertTrue("Worker load " + load + " should be 12 ± 1", 
+            assertTrue("Worker load " + load + " should be 12 ± 1",
                       Math.abs(load - 12) <= 1);
         }
-        
-        log.info("✓ Scenario 1 PASSED: Global balance achieved (min={}, max={}, diff={})", 
+
+        log.info("✓ Scenario 1 PASSED: Global balance achieved (min={}, max={}, diff={})",
                 minLoad, maxLoad, maxLoad - minLoad);
     }
 
     /**
      * Scenario 2: Consumer Config Change / Redeployment
-     * 
+     *
      * Tests that configuration changes maintain existing assignments (affinity preservation).
      * Expected: No task movement, same distribution as Scenario 1
      */
@@ -204,7 +204,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -237,16 +237,16 @@ public class GlobalBalanceTaskAssignorTest {
         for (WorkerLoad worker : workers) {
             int currentLoad = worker.connectorsSize() + worker.tasksSize();
             log.info("Worker {}: {} total (unchanged)", worker.worker(), currentLoad);
-            assertEquals("Worker load should not change", 
+            assertEquals("Worker load should not change",
                         initialLoads.get(worker.worker()).intValue(), currentLoad);
         }
-        
+
         log.info("✓ Scenario 2 PASSED: Affinity preserved");
     }
 
     /**
      * Scenario 3: Worker Scale Down Event
-     * 
+     *
      * Tests scaling down from 5 workers to 3 workers (W4, W5 removed).
      * Expected: Tasks redistributed evenly across 3 workers (20 tasks each)
      */
@@ -255,7 +255,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -273,7 +273,7 @@ public class GlobalBalanceTaskAssignorTest {
         }
 
         log.info("=== Scenario 3: Scale Down (5 → 3 workers) ===");
-        log.info("Total connectors: {}, Total tasks: {}, Workers: {}", 
+        log.info("Total connectors: {}, Total tasks: {}, Workers: {}",
                 connectors.size(), tasks.size(), workers.size());
 
         // Perform assignment
@@ -284,36 +284,36 @@ public class GlobalBalanceTaskAssignorTest {
         int totalAssignments = 0;
         int minLoad = Integer.MAX_VALUE;
         int maxLoad = 0;
-        
+
         for (WorkerLoad worker : workers) {
             int workerLoad = worker.tasksSize(); // Only count tasks for balance
             totalAssignments += workerLoad;
             minLoad = Math.min(minLoad, workerLoad);
             maxLoad = Math.max(maxLoad, workerLoad);
-            
-            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted", 
+
+            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted",
                     worker.worker(), worker.connectorsSize(), worker.tasksSize(), workerLoad);
         }
 
         // Assertions
         assertEquals("Total assignments mismatch", 60, totalAssignments);
-        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1", 
+        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1",
                    maxLoad - minLoad <= 1);
-        
+
         // Each worker should have 20 tasks (60/3)
         for (WorkerLoad worker : workers) {
             int load = worker.tasksSize(); // Only count tasks for balance
-            assertTrue("Worker load " + load + " should be 20 ± 1", 
+            assertTrue("Worker load " + load + " should be 20 ± 1",
                       Math.abs(load - 20) <= 1);
         }
-        
-        log.info("✓ Scenario 3 PASSED: Scale down balanced (min={}, max={}, diff={})", 
+
+        log.info("✓ Scenario 3 PASSED: Scale down balanced (min={}, max={}, diff={})",
                 minLoad, maxLoad, maxLoad - minLoad);
     }
 
     /**
      * Scenario 4: Worker Scale Up Event
-     * 
+     *
      * Tests scaling up from 3 workers to 6 workers (W4, W5, W6 added).
      * Expected: Tasks redistributed evenly across 6 workers (10 tasks each)
      */
@@ -322,7 +322,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -340,7 +340,7 @@ public class GlobalBalanceTaskAssignorTest {
         }
 
         log.info("=== Scenario 4: Scale Up (3 → 6 workers) ===");
-        log.info("Total connectors: {}, Total tasks: {}, Workers: {}", 
+        log.info("Total connectors: {}, Total tasks: {}, Workers: {}",
                 connectors.size(), tasks.size(), workers.size());
 
         // Perform assignment
@@ -351,39 +351,39 @@ public class GlobalBalanceTaskAssignorTest {
         int totalAssignments = 0;
         int minLoad = Integer.MAX_VALUE;
         int maxLoad = 0;
-        
+
         for (WorkerLoad worker : workers) {
             int workerLoad = worker.tasksSize(); // Only count tasks for balance
             totalAssignments += workerLoad;
             minLoad = Math.min(minLoad, workerLoad);
             maxLoad = Math.max(maxLoad, workerLoad);
-            
-            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted", 
+
+            log.info("Worker {}: {} connectors + {} tasks = {} tasks counted",
                     worker.worker(), worker.connectorsSize(), worker.tasksSize(), workerLoad);
         }
 
         // Assertions
         assertEquals("Total assignments mismatch", 60, totalAssignments);
-        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1", 
+        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1",
                    maxLoad - minLoad <= 1);
-        
+
         // Each worker should have approximately 10 tasks (60/6)
         // Use expected range based on min/max load rather than fixed value
         int expectedTasksPerWorker = totalAssignments / workers.size(); // Should be 10
         for (WorkerLoad worker : workers) {
             int load = worker.tasksSize();
-            assertTrue("Worker load " + load + " should be within global balance bounds [" + minLoad + 
-                       "," + maxLoad + "] with expected average " + expectedTasksPerWorker, 
+            assertTrue("Worker load " + load + " should be within global balance bounds [" + minLoad +
+                       "," + maxLoad + "] with expected average " + expectedTasksPerWorker,
                        load >= minLoad && load <= maxLoad);
         }
-        
-        log.info("✓ Scenario 4 PASSED: Scale up balanced (min={}, max={}, diff={}, avg={})", 
+
+        log.info("✓ Scenario 4 PASSED: Scale up balanced (min={}, max={}, diff={}, avg={})",
                 minLoad, maxLoad, maxLoad - minLoad, expectedTasksPerWorker);
     }
 
     /**
      * Test per-consumer balance requirement
-     * 
+     *
      * Verifies that for each consumer group, task count difference across workers ≤ 1
      */
     @Test
@@ -391,7 +391,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -416,7 +416,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         // Verify per-consumer balance for each consumer group
         Map<String, Map<String, Integer>> perConsumerCounts = new HashMap<>();
-        
+
         for (WorkerLoad worker : workers) {
             // Count connectors per consumer
             for (String connector : worker.connectors()) {
@@ -424,7 +424,7 @@ public class GlobalBalanceTaskAssignorTest {
                 perConsumerCounts.computeIfAbsent(consumerGroup, k -> new HashMap<>());
                 perConsumerCounts.get(consumerGroup).merge(worker.worker(), 1, Integer::sum);
             }
-            
+
             // Count tasks per consumer
             for (ConnectorTaskId task : worker.tasks()) {
                 String consumerGroup = assignor.extractConsumerFromConnector(task.connector());
@@ -437,18 +437,18 @@ public class GlobalBalanceTaskAssignorTest {
         for (Map.Entry<String, Map<String, Integer>> entry : perConsumerCounts.entrySet()) {
             String consumer = entry.getKey();
             Map<String, Integer> workerCounts = entry.getValue();
-            
+
             int min = Collections.min(workerCounts.values());
             int max = Collections.max(workerCounts.values());
-            
-            log.info("Consumer {}: distribution={}, min={}, max={}, diff={}", 
+
+            log.info("Consumer {}: distribution={}, min={}, max={}, diff={}",
                     consumer, workerCounts, min, max, max - min);
-            
-            assertTrue("Per-consumer balance violated for " + consumer + 
-                      ": max(" + max + ") - min(" + min + ") > 1", 
+
+            assertTrue("Per-consumer balance violated for " + consumer +
+                      ": max(" + max + ") - min(" + min + ") > 1",
                       max - min <= 1);
         }
-        
+
         log.info("✓ Per-Consumer Balance PASSED: All consumer groups balanced");
     }
 
@@ -460,7 +460,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         // Create a mock config state with connector configurations
         Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
-        
+
         // S3 Sink connector config like the example provided
         Map<String, String> s3SinkConfig = new HashMap<>();
         s3SinkConfig.put("name", "s3-sink-ctv_usage");
@@ -505,7 +505,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Test Scenario 1: Initial Allocation New Consumer Group Deployment
-     * 
+     *
      * Tests the complete performTaskAssignment method for initial allocation scenario.
      * This verifies the scenario detection and proper handling through handleInitialConnectorAllocation.
      */
@@ -514,7 +514,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // Create member assignments with 5 workers, all empty (no previous assignments)
@@ -541,7 +541,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         // Verify global balance
         verifyGlobalBalance(assignment.allAssignedTasks(), 5, 60);
-        
+
         // Verify per-consumer balance
         verifyPerConsumerBalance(assignment.allAssignedTasks(), assignor);
 
@@ -550,7 +550,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Test Scenario 2: Worker Scale Down Event
-     * 
+     *
      * Tests scaling down from 5 workers to 3 workers.
      * This should preserve existing assignments and only redistribute unassigned work.
      */
@@ -559,7 +559,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // First, create initial state with 5 workers
@@ -609,7 +609,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Test Scenario 3: Worker Scale Up Event
-     * 
+     *
      * Tests scaling up from 3 workers to 6 workers.
      * This should rebalance high-task consumers while maintaining balance requirements.
      */
@@ -618,7 +618,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // First, establish baseline with 3 workers
@@ -672,7 +672,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Test Scenario 4: Catch All & Consumer Config Change / Update
-     * 
+     *
      * Tests the OTHER scenario that triggers full rebalance.
      * This should redistribute all work while maintaining balance requirements.
      */
@@ -681,7 +681,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // Create baseline assignment with 6 workers
@@ -732,7 +732,7 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Test Multi-Scenario Worker Lifecycle
-     * 
+     *
      * Tests a complete lifecycle: Initial → Scale Down → Scale Up → Config Change
      * This verifies that the assignor correctly handles scenario transitions.
      */
@@ -741,7 +741,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         log.info("=== Complete Worker Lifecycle Test ===");
@@ -754,7 +754,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment phase1Result = assignor.performTaskAssignment(
                 configState, 0, 1, phase1Assignments);
-        
+
         log.info("Phase 1 (Initial): 5 workers, 12 tasks each");
         verifyGlobalBalance(phase1Result.allAssignedTasks(), 5, 60);
 
@@ -814,10 +814,10 @@ public class GlobalBalanceTaskAssignorTest {
 
         log.info("✓ Complete Lifecycle PASSED: All scenarios handled correctly");
     }
-    
+
     /**
      * Test Config Changes Without Task Max Change
-     * 
+     *
      * Tests that configuration changes that don't affect tasks.max
      * maintain existing assignments and preserve global balance.
      * Expected: No task movement, same distribution as before with affinity preserved
@@ -827,7 +827,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // Create 5 workers with initial assignments
@@ -839,17 +839,17 @@ public class GlobalBalanceTaskAssignorTest {
         // Initial assignment
         ClusterAssignment initialResult = assignor.performTaskAssignment(
                 configState, 0, 1, initialAssignments);
-        
+
         log.info("=== Test Config Change Without Task Max Change ===");
         log.info("Initial assignment with 5 workers, 12 tasks each");
 
         // Create updated config state with same tasks.max but different non-essential configs
         ClusterConfigState updatedConfigState = createConfigStateWithSameTaskMax();
-        
+
         // Create a new assignor with updated config
         GlobalBalanceTaskAssignor newAssignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         newAssignor.configSnapshot = updatedConfigState;
-        
+
         // Use existing assignments from initial result
         Map<String, ConnectorsAndTasks> existingAssignments = new HashMap<>();
         for (int i = 1; i <= 5; i++) {
@@ -863,36 +863,36 @@ public class GlobalBalanceTaskAssignorTest {
         // Perform assignment with updated config but same task counts
         ClusterAssignment updatedResult = newAssignor.performTaskAssignment(
                 updatedConfigState, 1, 2, existingAssignments);
-        
+
         log.info("Updated config assignment with 5 workers");
 
         // Verify results - should have same task count as before
         int totalTasks = updatedResult.allAssignedTasks().values().stream()
                 .mapToInt(Collection::size).sum();
         assertEquals("Total task count should be preserved", 60, totalTasks);
-        
+
         // Verify global balance is maintained
         verifyGlobalBalance(updatedResult.allAssignedTasks(), 5, 60);
-        
+
         // Verify task assignments remain the same (affinity is preserved)
         for (String workerId : initialResult.allAssignedTasks().keySet()) {
             Collection<ConnectorTaskId> initialTasks = initialResult.allAssignedTasks().get(workerId);
             Collection<ConnectorTaskId> updatedTasks = updatedResult.allAssignedTasks().get(workerId);
-            
+
             // Convert to sets to ensure order-independent comparison
             assertEquals("Tasks should be preserved for worker " + workerId,
                         new HashSet<>(initialTasks), new HashSet<>(updatedTasks));
         }
-        
+
         // Verify per-consumer balance
         verifyPerConsumerBalance(updatedResult.allAssignedTasks(), newAssignor);
-        
+
         log.info("✓ Config change without task.max change PASSED: Global balance and task affinity preserved");
     }
-    
+
     /**
      * Test Config Changes With Task Max Change
-     * 
+     *
      * Tests that configuration changes that affect tasks.max
      * trigger appropriate rebalancing while maintaining global balance.
      * Expected: Task redistribution with global balance maintained
@@ -902,7 +902,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
 
         // Create 5 workers with initial assignments
@@ -914,17 +914,17 @@ public class GlobalBalanceTaskAssignorTest {
         // Initial assignment
         ClusterAssignment initialResult = assignor.performTaskAssignment(
                 configState, 0, 1, initialAssignments);
-        
+
         log.info("=== Test Config Change With Task Max Change ===");
         log.info("Initial assignment: 5 workers, 60 total tasks");
 
         // Create updated config state with different tasks.max
         ClusterConfigState updatedConfigState = createConfigStateWithDifferentTaskMax();
-        
+
         // Create a new assignor with updated config
         GlobalBalanceTaskAssignor newAssignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         newAssignor.configSnapshot = updatedConfigState;  // Explicitly set the updated config
-        
+
         // Use existing assignments from initial result
         Map<String, ConnectorsAndTasks> existingAssignments = new HashMap<>();
         for (int i = 1; i <= 5; i++) {
@@ -938,26 +938,26 @@ public class GlobalBalanceTaskAssignorTest {
         // Perform assignment with updated config that has different task counts
         ClusterAssignment updatedResult = newAssignor.performTaskAssignment(
                 updatedConfigState, 1, 2, existingAssignments);
-        
+
         // Get the actual total task count after assignment
         int totalTasks = updatedResult.allAssignedTasks().values().stream()
                 .mapToInt(Collection::size).sum();
-        
+
         log.info("Updated config assignment with 5 workers, {} total tasks (changed from 60)", totalTasks);
-        
+
         // Verify results - accept the actual task count as the expected value
         // This is valid because we're not testing the task count itself, but that the assignor properly balances tasks
         assertTrue("Total tasks should be different after config change with task.max changes", totalTasks != 60);
-        
+
         // Verify global balance is maintained
         verifyGlobalBalance(updatedResult.allAssignedTasks(), 5, totalTasks);
-        
+
         // Verify per-consumer balance
         verifyPerConsumerBalance(updatedResult.allAssignedTasks(), newAssignor);
-        
+
         log.info("✓ Config change with task.max change PASSED: Global balance maintained with new task count");
     }
-    
+
     /**
      * Helper method to create a config state with the same task.max values
      * but different non-essential configs (like topic.configs)
@@ -965,7 +965,7 @@ public class GlobalBalanceTaskAssignorTest {
     private ClusterConfigState createConfigStateWithSameTaskMax() {
         Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
         Map<String, Integer> taskCounts = new HashMap<>();
-        
+
         // C1: 18 tasks (same as original config)
         for (int i = 1; i <= 18; i++) {
             Map<String, String> config = new HashMap<>();
@@ -977,7 +977,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C1-connector" + i, config);
             taskCounts.put("C1-connector" + i, 1);  // Each connector has 1 task (unchanged)
         }
-        
+
         // C2: 11 tasks (same as original config)
         for (int i = 1; i <= 11; i++) {
             Map<String, String> config = new HashMap<>();
@@ -989,7 +989,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C2-connector" + i, config);
             taskCounts.put("C2-connector" + i, 1);  // Each connector has 1 task (unchanged)
         }
-        
+
         // Rest of connectors same as original config but with additional non-essential configs
         // C3: 7 tasks
         for (int i = 1; i <= 7; i++) {
@@ -1000,7 +1000,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C3-connector" + i, config);
             taskCounts.put("C3-connector" + i, 1);  // Each connector has 1 task (unchanged)
         }
-        
+
         // C4, C5, C6: 4 tasks each
         for (String consumer : Arrays.asList("C4", "C5", "C6")) {
             for (int i = 1; i <= 4; i++) {
@@ -1012,7 +1012,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);  // Each connector has 1 task (unchanged)
             }
         }
-        
+
         // C7, C8: 3 tasks each
         for (String consumer : Arrays.asList("C7", "C8")) {
             for (int i = 1; i <= 3; i++) {
@@ -1024,7 +1024,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);  // Each connector has 1 task (unchanged)
             }
         }
-        
+
         // C9-C14: 1 task each
         for (String consumer : Arrays.asList("C9", "C10", "C11", "C12", "C13", "C14")) {
             Map<String, String> config = new HashMap<>();
@@ -1034,7 +1034,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(consumer + "-connector1", config);
             taskCounts.put(consumer + "-connector1", 1);  // Each connector has 1 task (unchanged)
         }
-        
+
         return new ClusterConfigState(
                 2L, // Different generation ID
                 null,
@@ -1048,7 +1048,7 @@ public class GlobalBalanceTaskAssignorTest {
                 Collections.emptySet()   // inconsistentConnectors
         );
     }
-    
+
     /**
      * Helper method to create a config state with different task.max values
      * - C1: increased from 18 tasks to 24 tasks
@@ -1058,7 +1058,7 @@ public class GlobalBalanceTaskAssignorTest {
     private ClusterConfigState createConfigStateWithDifferentTaskMax() {
         Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
         Map<String, Integer> taskCounts = new HashMap<>();
-        
+
         // C1: 24 total tasks (increased from 18)
         // First, keep the original 18 connectors with 1 task each
         for (int i = 1; i <= 18; i++) {
@@ -1076,7 +1076,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C1-connector" + i, config);
             taskCounts.put("C1-connector" + i, 1);
         }
-        
+
         // C2: 8 tasks (decreased from 11)
         for (int i = 1; i <= 8; i++) {
             Map<String, String> config = new HashMap<>();
@@ -1086,7 +1086,7 @@ public class GlobalBalanceTaskAssignorTest {
             taskCounts.put("C2-connector" + i, 1);
         }
         // Note: Connectors 9-11 are removed
-        
+
         // Rest of connectors unchanged
         // C3: 7 tasks
         for (int i = 1; i <= 7; i++) {
@@ -1096,7 +1096,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put("C3-connector" + i, config);
             taskCounts.put("C3-connector" + i, 1);
         }
-        
+
         // C4, C5, C6: 4 tasks each
         for (String consumer : Arrays.asList("C4", "C5", "C6")) {
             for (int i = 1; i <= 4; i++) {
@@ -1107,7 +1107,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);
             }
         }
-        
+
         // C7, C8: 3 tasks each
         for (String consumer : Arrays.asList("C7", "C8")) {
             for (int i = 1; i <= 3; i++) {
@@ -1118,7 +1118,7 @@ public class GlobalBalanceTaskAssignorTest {
                 taskCounts.put(consumer + "-connector" + i, 1);
             }
         }
-        
+
         // C9-C14: 1 task each
         for (String consumer : Arrays.asList("C9", "C10", "C11", "C12", "C13", "C14")) {
             Map<String, String> config = new HashMap<>();
@@ -1127,7 +1127,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(consumer + "-connector1", config);
             taskCounts.put(consumer + "-connector1", 1);
         }
-        
+
         return new ClusterConfigState(
                 2L, // Different generation ID
                 null,
@@ -1144,12 +1144,12 @@ public class GlobalBalanceTaskAssignorTest {
 
     /**
      * Triplelift Workload Test with Worker Scaling Scenarios
-     * 
+     *
      * Tests a Triplelift-specific workload through a series of scaling events:
      * 1. Initial allocation with 7 workers
      * 2. Scale up to 11 workers
      * 3. Scale down to 9 workers
-     * 4. Scale down to 5 workers 
+     * 4. Scale down to 5 workers
      * 5. Scale up to 7 workers
      */
     @Test
@@ -1157,7 +1157,7 @@ public class GlobalBalanceTaskAssignorTest {
         logContext = new LogContext();
         time = new MockTime();
         configState = createTripleliftConfigState();
-        
+
         GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
         assignor.configSnapshot = configState;
 
@@ -1166,7 +1166,7 @@ public class GlobalBalanceTaskAssignorTest {
         for (String connector : configState.connectors()) {
             totalTaskCount += configState.taskCount(connector);
         }
-        
+
         log.info("Triplelift workload: {} connectors, {} total tasks", configState.connectors().size(), totalTaskCount);
 
         // Step 1: Initial allocation with 7 workers
@@ -1178,7 +1178,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment step1Result = assignor.performTaskAssignment(
                 configState, 0, 1, step1Assignments);
-        
+
         // Verify initial allocation balance
         verifyGlobalBalance(step1Result.allAssignedTasks(), 7, totalTaskCount);
         verifyPerConsumerBalance(step1Result.allAssignedTasks(), assignor);
@@ -1187,7 +1187,7 @@ public class GlobalBalanceTaskAssignorTest {
         // Step 2: Scale up to 11 workers
         log.info("=== Step 2: Triplelift Scale Up (7→11 workers) ===");
         Map<String, ConnectorsAndTasks> step2Assignments = new HashMap<>();
-        
+
         // Preserve existing worker assignments
         for (int i = 1; i <= 7; i++) {
             String workerId = "W" + i;
@@ -1196,7 +1196,7 @@ public class GlobalBalanceTaskAssignorTest {
             step2Assignments.put(workerId, new ConnectorsAndTasks.Builder()
                     .with(workerConnectors, workerTasks).build());
         }
-        
+
         // Add new workers
         for (int i = 8; i <= 11; i++) {
             step2Assignments.put("W" + i, new ConnectorsAndTasks.Builder().build());
@@ -1204,7 +1204,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment step2Result = assignor.performTaskAssignment(
                 configState, 1, 2, step2Assignments);
-        
+
         // Verify scale-up balance
         verifyGlobalBalance(step2Result.allAssignedTasks(), 11, totalTaskCount);
         verifyPerConsumerBalance(step2Result.allAssignedTasks(), assignor);
@@ -1213,7 +1213,7 @@ public class GlobalBalanceTaskAssignorTest {
         // Step 3: Scale down to 9 workers (remove W10, W11)
         log.info("=== Step 3: Triplelift Scale Down (11→9 workers) ===");
         Map<String, ConnectorsAndTasks> step3Assignments = new HashMap<>();
-        
+
         // Preserve existing worker assignments for remaining workers
         for (int i = 1; i <= 9; i++) {
             String workerId = "W" + i;
@@ -1225,7 +1225,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment step3Result = assignor.performTaskAssignment(
                 configState, 2, 3, step3Assignments);
-        
+
         // Verify scale-down balance
         verifyGlobalBalance(step3Result.allAssignedTasks(), 9, totalTaskCount);
         verifyPerConsumerBalance(step3Result.allAssignedTasks(), assignor);
@@ -1234,7 +1234,7 @@ public class GlobalBalanceTaskAssignorTest {
         // Step 4: Scale down to 5 workers (remove W6-W9)
         log.info("=== Step 4: Triplelift Scale Down (9→5 workers) ===");
         Map<String, ConnectorsAndTasks> step4Assignments = new HashMap<>();
-        
+
         // Preserve existing worker assignments for remaining workers
         for (int i = 1; i <= 5; i++) {
             String workerId = "W" + i;
@@ -1246,7 +1246,7 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment step4Result = assignor.performTaskAssignment(
                 configState, 3, 4, step4Assignments);
-        
+
         // Verify scale-down balance
         verifyGlobalBalance(step4Result.allAssignedTasks(), 5, totalTaskCount);
         verifyPerConsumerBalance(step4Result.allAssignedTasks(), assignor);
@@ -1255,7 +1255,7 @@ public class GlobalBalanceTaskAssignorTest {
         // Step 5: Scale up to 7 workers (add W6, W7)
         log.info("=== Step 5: Triplelift Scale Up (5→7 workers) ===");
         Map<String, ConnectorsAndTasks> step5Assignments = new HashMap<>();
-        
+
         // Preserve existing worker assignments
         for (int i = 1; i <= 5; i++) {
             String workerId = "W" + i;
@@ -1264,7 +1264,7 @@ public class GlobalBalanceTaskAssignorTest {
             step5Assignments.put(workerId, new ConnectorsAndTasks.Builder()
                     .with(workerConnectors, workerTasks).build());
         }
-        
+
         // Add new workers
         for (int i = 6; i <= 7; i++) {
             step5Assignments.put("W" + i, new ConnectorsAndTasks.Builder().build());
@@ -1272,12 +1272,12 @@ public class GlobalBalanceTaskAssignorTest {
 
         ClusterAssignment step5Result = assignor.performTaskAssignment(
                 configState, 4, 5, step5Assignments);
-        
+
         // Verify scale-up balance
         verifyGlobalBalance(step5Result.allAssignedTasks(), 7, totalTaskCount);
         verifyPerConsumerBalance(step5Result.allAssignedTasks(), assignor);
         log.info("✓ Step 5 PASSED: Scale up to 7 workers balanced");
-        
+
         log.info("✓✓ All Triplelift Workload Tests PASSED: Balance maintained through all scaling events");
     }
 
@@ -1294,14 +1294,14 @@ public class GlobalBalanceTaskAssignorTest {
         int minLoad = taskAssignments.values().stream().mapToInt(Collection::size).min().orElse(0);
         int maxLoad = taskAssignments.values().stream().mapToInt(Collection::size).max().orElse(0);
 
-        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1", 
+        assertTrue("Global balance violated: max(" + maxLoad + ") - min(" + minLoad + ") > 1",
                    maxLoad - minLoad <= 1);
 
         int expectedTasksPerWorker = expectedTotalTasks / expectedWorkers;
         for (Map.Entry<String, Collection<ConnectorTaskId>> entry : taskAssignments.entrySet()) {
             int workerTasks = entry.getValue().size();
-            assertTrue("Worker " + entry.getKey() + " has " + workerTasks + " tasks, expected " + 
-                      expectedTasksPerWorker + " ± 1", 
+            assertTrue("Worker " + entry.getKey() + " has " + workerTasks + " tasks, expected " +
+                      expectedTasksPerWorker + " ± 1",
                       Math.abs(workerTasks - expectedTasksPerWorker) <= 1);
         }
     }
@@ -1316,7 +1316,7 @@ public class GlobalBalanceTaskAssignorTest {
      * - 3 connector with 6 tasks
      * - 3 connectors with 3 tasks
      * - 3 connectors with 1 task
-     * 
+     *
      * Total: 343 tasks
      */
     private ClusterConfigState createTripleliftConfigState() {
@@ -1329,21 +1329,21 @@ public class GlobalBalanceTaskAssignorTest {
         connector1Config.put("tasks.max", "124");
         connectorConfigs.put("TL1-connector", connector1Config);
         taskCounts.put("TL1-connector", 124);
-        
+
         // 1 connector with 82 tasks
         Map<String, String> connector2Config = new HashMap<>();
         connector2Config.put("name", "TL2-connector");
         connector2Config.put("tasks.max", "82");
         connectorConfigs.put("TL2-connector", connector2Config);
         taskCounts.put("TL2-connector", 82);
-        
+
         // 1 connector with 44 tasks
         Map<String, String> connector3Config = new HashMap<>();
         connector3Config.put("name", "TL3-connector");
         connector3Config.put("tasks.max", "44");
         connectorConfigs.put("TL3-connector", connector3Config);
         taskCounts.put("TL3-connector", 44);
-        
+
         // 3 connectors with 21 tasks each
         for (int i = 1; i <= 3; i++) {
             Map<String, String> config = new HashMap<>();
@@ -1353,7 +1353,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(connectorName, config);
             taskCounts.put(connectorName, 21);
         }
-        
+
         // 3 connectors with 6 tasks each
         for (int i = 1; i <= 3; i++) {
             Map<String, String> config = new HashMap<>();
@@ -1363,7 +1363,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(connectorName, config);
             taskCounts.put(connectorName, 6);
         }
-        
+
         // 3 connectors with 3 tasks each
         for (int i = 1; i <= 3; i++) {
             Map<String, String> config = new HashMap<>();
@@ -1373,7 +1373,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(connectorName, config);
             taskCounts.put(connectorName, 3);
         }
-        
+
         // 3 connectors with 1 task each
         for (int i = 1; i <= 3; i++) {
             Map<String, String> config = new HashMap<>();
@@ -1383,7 +1383,7 @@ public class GlobalBalanceTaskAssignorTest {
             connectorConfigs.put(connectorName, config);
             taskCounts.put(connectorName, 1);
         }
-        
+
         return new ClusterConfigState(
                 1L,
                 null,
@@ -1407,7 +1407,7 @@ public class GlobalBalanceTaskAssignorTest {
                                         GlobalBalanceTaskAssignor assignor) {
         // Group tasks by consumer
         Map<String, Map<String, Integer>> consumerTaskCounts = new HashMap<>();
-        
+
         for (Map.Entry<String, Collection<ConnectorTaskId>> entry : taskAssignments.entrySet()) {
             String workerId = entry.getKey();
             for (ConnectorTaskId task : entry.getValue()) {
@@ -1421,13 +1421,152 @@ public class GlobalBalanceTaskAssignorTest {
         for (Map.Entry<String, Map<String, Integer>> consumerEntry : consumerTaskCounts.entrySet()) {
             String consumer = consumerEntry.getKey();
             Map<String, Integer> workerCounts = consumerEntry.getValue();
-            
+
             int minConsumerTasks = workerCounts.values().stream().mapToInt(Integer::intValue).min().orElse(0);
             int maxConsumerTasks = workerCounts.values().stream().mapToInt(Integer::intValue).max().orElse(0);
-            
-            assertTrue("Consumer " + consumer + " balance violated: max(" + maxConsumerTasks + 
-                      ") - min(" + minConsumerTasks + ") > 1", 
+
+            assertTrue("Consumer " + consumer + " balance violated: max(" + maxConsumerTasks +
+                      ") - min(" + minConsumerTasks + ") > 1",
                       maxConsumerTasks - minConsumerTasks <= 1);
         }
+    }
+
+    /**
+     * Test tasks.max configuration changes
+     *
+     * Tests that tasks.max changes are properly handled by creating/removing tasks
+     * while maintaining global balance requirements.
+     */
+    @Test
+    public void testTasksMaxConfigurationChanges() {
+        logContext = new LogContext();
+        time = new MockTime();
+
+        GlobalBalanceTaskAssignor assignor = new GlobalBalanceTaskAssignor(logContext, time, 0);
+
+        // Create initial config with 3 connectors, each with 2 tasks
+        Map<String, String> connectorConfig1 = new HashMap<>();
+        connectorConfig1.put("name", "test-connector-1");
+        connectorConfig1.put("tasks.max", "2");
+
+        Map<String, String> connectorConfig2 = new HashMap<>();
+        connectorConfig2.put("name", "test-connector-2");
+        connectorConfig2.put("tasks.max", "2");
+
+        Map<String, String> connectorConfig3 = new HashMap<>();
+        connectorConfig3.put("name", "test-connector-3");
+        connectorConfig3.put("tasks.max", "2");
+
+        Map<String, Map<String, String>> connectorConfigs = new HashMap<>();
+        connectorConfigs.put("test-connector-1", connectorConfig1);
+        connectorConfigs.put("test-connector-2", connectorConfig2);
+        connectorConfigs.put("test-connector-3", connectorConfig3);
+
+        Map<String, Integer> taskCounts = new HashMap<>();
+        taskCounts.put("test-connector-1", 2);
+        taskCounts.put("test-connector-2", 2);
+        taskCounts.put("test-connector-3", 2);
+
+        ClusterConfigState initialConfig = new ClusterConfigState(
+                1L, null, taskCounts, connectorConfigs,
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptySet(), Collections.emptySet()
+        );
+
+        assignor.configSnapshot = initialConfig;
+
+        // Create initial assignment with 2 workers
+        Map<String, ConnectorsAndTasks> initialAssignments = new HashMap<>();
+
+        // Worker 1 gets connectors 1,2 and tasks (1-0, 1-1, 2-0)
+        initialAssignments.put("worker1", new ConnectorsAndTasks.Builder()
+                .with(Arrays.asList("test-connector-1", "test-connector-2"),
+                      Arrays.asList(new ConnectorTaskId("test-connector-1", 0),
+                                   new ConnectorTaskId("test-connector-1", 1),
+                                   new ConnectorTaskId("test-connector-2", 0)))
+                .build());
+
+        // Worker 2 gets connector 3 and tasks (2-1, 3-0, 3-1)
+        initialAssignments.put("worker2", new ConnectorsAndTasks.Builder()
+                .with(Arrays.asList("test-connector-3"),
+                      Arrays.asList(new ConnectorTaskId("test-connector-2", 1),
+                                   new ConnectorTaskId("test-connector-3", 0),
+                                   new ConnectorTaskId("test-connector-3", 1)))
+                .build());
+
+        log.info("=== Testing tasks.max Configuration Changes ===");
+        log.info("Initial state: 3 connectors, 2 tasks each = 6 total tasks");
+
+        // Test 1: Increase tasks.max for connector-1 from 2 to 4
+        connectorConfig1.put("tasks.max", "4");
+        taskCounts.put("test-connector-1", 4);
+
+        ClusterConfigState updatedConfig = new ClusterConfigState(
+                2L, null, taskCounts, connectorConfigs,
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptySet(), Collections.emptySet()
+        );
+
+        assignor.configSnapshot = updatedConfig;
+
+        ClusterAssignment result = assignor.performTaskAssignment(
+                updatedConfig, 0, 1, initialAssignments);
+
+        // Verify new tasks were created and assigned
+        int totalNewTasks = result.newlyAssignedTasks().values().stream()
+                .mapToInt(Collection::size).sum();
+
+        assertTrue("Should have 2 new tasks assigned", totalNewTasks >= 2);
+
+        // Verify final balance
+        int totalFinalTasks = result.allAssignedTasks().values().stream()
+                .mapToInt(Collection::size).sum();
+        assertEquals("Should have 8 total tasks (6 + 2 new)", 8, totalFinalTasks);
+
+        log.info("✓ Test 1 PASSED: tasks.max increase handled correctly");
+
+        // Test 2: Decrease tasks.max for connector-2 from 2 to 1
+        connectorConfig2.put("tasks.max", "1");
+        taskCounts.put("test-connector-2", 1);
+
+        ClusterConfigState decreasedConfig = new ClusterConfigState(
+                3L, null, taskCounts, connectorConfigs,
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptyMap(), Collections.emptyMap(),
+                Collections.emptySet(), Collections.emptySet()
+        );
+
+        assignor.configSnapshot = decreasedConfig;
+
+        // Create current assignments reflecting the previous change
+        Map<String, ConnectorsAndTasks> currentAssignments = new HashMap<>();
+        currentAssignments.put("worker1", new ConnectorsAndTasks.Builder()
+                .with(Arrays.asList("test-connector-1", "test-connector-2"),
+                      Arrays.asList(new ConnectorTaskId("test-connector-1", 0),
+                                   new ConnectorTaskId("test-connector-1", 1),
+                                   new ConnectorTaskId("test-connector-1", 2),
+                                   new ConnectorTaskId("test-connector-2", 0),
+                                   new ConnectorTaskId("test-connector-2", 1)))
+                .build());
+
+        currentAssignments.put("worker2", new ConnectorsAndTasks.Builder()
+                .with(Arrays.asList("test-connector-3"),
+                      Arrays.asList(new ConnectorTaskId("test-connector-1", 3),
+                                   new ConnectorTaskId("test-connector-3", 0),
+                                   new ConnectorTaskId("test-connector-3", 1)))
+                .build());
+
+        ClusterAssignment decreaseResult = assignor.performTaskAssignment(
+                decreasedConfig, 1, 2, currentAssignments);
+
+        // Verify task was removed
+        int finalTaskCount = decreaseResult.allAssignedTasks().values().stream()
+                .mapToInt(Collection::size).sum();
+        assertEquals("Should have 7 total tasks (8 - 1 removed)", 7, finalTaskCount);
+
+        log.info("✓ Test 2 PASSED: tasks.max decrease handled correctly");
+        log.info("✓ tasks.max configuration changes test completed successfully");
     }
 }
