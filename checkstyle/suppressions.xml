@@ -170,7 +170,7 @@
               files="DistributedHerderTest.java"/>
 
     <suppress checks="MethodLength"
-              files="(RequestResponse|WorkerSinkTask)Test.java"/>
+              files="(RequestResponse|WorkerSinkTask|GlobalBalanceTaskAssignor)Test.java"/>
 
     <suppress checks="JavaNCSS"
               files="(DistributedHerder|Worker)Test.java"/>
