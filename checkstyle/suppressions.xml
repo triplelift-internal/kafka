@@ -158,7 +158,7 @@
               files="(DistributedHerder|RestClient|RestServer|JsonConverter|KafkaConfigBackingStore|FileStreamSourceTask|WorkerSourceTask|TopicAdmin).java"/>
 
     <suppress checks="(CyclomaticComplexity|MethodLength|JavaNCSS|NPathComplexity)"
-              files="GlobalBalanceTaskAssignor.java"/>
+              files="BalancedCooperativeAssignor.java"/>
 
     <!-- connect tests-->
     <suppress checks="ClassDataAbstractionCoupling"
@@ -170,7 +170,7 @@
               files="DistributedHerderTest.java"/>
 
     <suppress checks="MethodLength"
-              files="(RequestResponse|WorkerSinkTask|GlobalBalanceTaskAssignor)Test.java"/>
+              files="(RequestResponse|WorkerSinkTask)Test.java"/>
 
     <suppress checks="JavaNCSS"
               files="(DistributedHerder|Worker)Test.java"/>

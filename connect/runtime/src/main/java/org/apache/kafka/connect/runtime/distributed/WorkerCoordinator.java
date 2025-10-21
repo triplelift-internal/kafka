@@ -98,7 +98,7 @@ public class WorkerCoordinator extends AbstractCoordinator implements Closeable 
         this.rejoinRequested = false;
         this.protocolCompatibility = protocolCompatibility;
         this.incrementalAssignor = enableGlobalBalanceTaskAssignor
-                ? new GlobalBalanceTaskAssignor(logContext, time, maxDelay)
+                ? new BalancedCooperativeAssignor(logContext, time, maxDelay)
                 : new IncrementalCooperativeAssignor(logContext, time, maxDelay);
         this.eagerAssignor = new EagerAssignor(logContext);
         this.currentConnectProtocol = protocolCompatibility;
