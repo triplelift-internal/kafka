@@ -45,10 +45,19 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 /**
- * Simple tests for BalancedCooperativeAssignor to identify root causes of failures.
+ * Comprehensive tests for BalancedCooperativeAssignor covering all scenarios.
  * 
- * This test class uses minimal scenarios (3 workers, 1 connector, 10 tasks) to isolate
- * and debug issues with the balanced cooperative rebalancing algorithm.
+ * Tests verify the two-round protocol:
+ * - Round 1 (Revocations): Full revocation when triggered by empty workers or severe imbalance
+ * - Round 2 (Assignments): Incremental assignment with Phase A (consumerN_task_count_min) and Phase B (remaining)
+ * 
+ * Scenarios tested (from algorithm specification):
+ * 1. Scale-up (empty workers) → Round 1 + Round 2
+ * 2. Scale-down (workers left) → Round 2 only
+ * 3. Task count increase → Round 2 only
+ * 4. New connector added → Round 1 (if creates empty workers) + Round 2
+ * 5. Connector removed → Round 2 only
+ * 6. Task count decrease → Round 2 only
  */
 public class BalancedCooperativeAssignorTest {
     private static final Logger log = LoggerFactory.getLogger(BalancedCooperativeAssignorTest.class);
@@ -71,9 +80,6 @@ public class BalancedCooperativeAssignorTest {
         rebalanceDelay = DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT;
         connectors = new HashMap<>();
         memberAssignments = new HashMap<>();
-        
-        // Start with 3 workers for simple testing
-        addNewEmptyWorkers("worker1", "worker2", "worker3");
         initAssignor();
     }
 
@@ -82,198 +88,568 @@ public class BalancedCooperativeAssignorTest {
         assignor.previousGenerationId = generationId;
     }
 
+    // ==================== SCENARIO 1: Scale-Up (Empty Workers) ====================
+    
     /**
-     * Test 1: Simple initial assignment
-     * - 3 workers, all empty
-     * - 1 connector with 10 tasks
-     * - Expected: Each worker gets 3-4 tasks (balanced)
+     * Scenario 1: Scale-Up from 0 to 3 workers
+     * Expected Flow:
+     * - Round 1: Full revocation (all tasks unassigned)
+     * - Round 2: Complete assignment with perfect balance
+     * 
+     * This tests the classic scale-up scenario where new workers join an empty cluster.
      */
     @Test
-    public void testSimpleInitialAssignment() {
-        log.info("=== Test 1: Simple Initial Assignment ===");
+    public void testScenario1_ScaleUpFrom0To3Workers() {
+        log.info("=== SCENARIO 1: Scale-Up (0→3 workers) ===");
+        
+        // Start with 3 empty workers
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
         
         // Add 1 connector with 10 tasks
-        addNewConnector("C1-connector1", 10);
+        addNewConnector("connector-1", 10);
         
-        // Round 1: Initial assignment
+        // Round 1 would be triggered (empty workers), but there's nothing to revoke
+        // So we skip directly to Round 2 (assignments) in a single rebalance
         performStandardRebalance();
         
-        log.info("After Round 1:");
+        log.info("After rebalance (Round 2 - assignments):");
         logAllAssignments();
         
-        // Verify no duplicate connectors
-        assertNoDuplicateConnectorAssignments();
+        // Verify: All 10 tasks assigned in single rebalance, no revocations
+        assertRound2Behavior(10, 0);  // 10 assignments, 0 revocations
         
-        // Verify all tasks assigned
+        // Verify final balance: 3-4 tasks per worker
+        assertBalancedDistribution(3, 4);
         assertAllTasksAssigned();
+        assertNoDuplicateConnectorAssignments();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
         
-        // Verify balanced (each worker should have 3-4 tasks)
-        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
-            int taskCount = entry.getValue().tasks().size();
-            assertTrue("Worker " + entry.getKey() + " has " + taskCount + " tasks, expected 3-4",
-                    taskCount >= 3 && taskCount <= 4);
-        }
-        
-        log.info("✓ Test 1 passed: Simple initial assignment works correctly");
+        log.info("✓ SCENARIO 1 passed: Scale-up handled correctly");
     }
-
+    
     /**
-     * Test 2: Rebalance from imbalanced state
-     * - 3 workers: worker1=7, worker2=3, worker3=0
-     * - 1 connector with 10 tasks total
-     * - Expected: Converge to balanced state (3-4 tasks each) within a few rounds
+     * Scenario 1b: Scale-Up from 2 to 5 workers (with existing load)
+     * Expected Flow:
+     * - Round 1: Full revocation from all workers
+     * - Round 2: Redistribute across all 5 workers
      */
     @Test
-    public void testRebalanceFromImbalancedState() {
-        log.info("=== Test 2: Rebalance from Imbalanced State ===");
+    public void testScenario1b_ScaleUpFrom2To5WorkersWithExistingLoad() {
+        log.info("=== SCENARIO 1b: Scale-Up (2→5 workers with existing load) ===");
         
-        // Add connector
-        addNewConnector("C1-connector1", 10);
+        // Start with 2 workers, balanced assignment
+        addNewEmptyWorkers("worker1", "worker2");
+        addNewConnector("connector-1", 10);
+        performStandardRebalance();
         
-        // Setup imbalanced initial state
-        List<ConnectorTaskId> worker1Tasks = createTaskIds("C1-connector1", 0, 1, 2, 3, 4, 5, 6);
-        List<ConnectorTaskId> worker2Tasks = createTaskIds("C1-connector1", 7, 8, 9);
+        log.info("Initial state (2 workers, 10 tasks):");
+        logAllAssignments();
+        assertEquals(5, memberAssignments.get("worker1").tasks().size());
+        assertEquals(5, memberAssignments.get("worker2").tasks().size());
         
-        // Only worker1 gets the connector (connectors are not split, only tasks)
+        // Add 3 new empty workers
+        addNewEmptyWorkers("worker3", "worker4", "worker5");
+        
+        log.info("After adding 3 empty workers:");
+        logAllAssignments();
+        
+        // Round 1: Should revoke all tasks from existing workers
+        performStandardRebalance();
+        
+        log.info("After Round 1 (Revocation):");
+        logAllAssignments();
+        
+        // Verify Round 1: All 10 tasks revoked, no assignments yet
+        assertRound1Behavior(10, 0);
+        
+        // All workers should now have 0 tasks after Round 1
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            assertEquals("After Round 1, all workers should have 0 tasks", 
+                    0, assignment.tasks().size());
+        }
+        
+        // Round 2: Assign all tasks across 5 workers
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Assignment):");
+        logAllAssignments();
+        
+        // Verify Round 2: All 10 tasks assigned, no revocations
+        assertRound2Behavior(10, 0);
+        
+        // Verify final balance: 2 tasks per worker (10 tasks / 5 workers)
+        assertBalancedDistribution(2, 2);
+        assertAllTasksAssigned();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 1b passed: Scale-up with existing load handled correctly");
+    }
+
+    // ==================== SCENARIO 2: Scale-Down (Workers Left) ====================
+    
+    /**
+     * Scenario 2: Scale-Down from 5 to 3 workers
+     * Expected Flow:
+     * - Round 1: SKIPPED (no empty workers, no severe imbalance)
+     * - Round 2: Incremental assignment of lost tasks only
+     * 
+     * Key: Existing tasks on remaining workers are preserved!
+     */
+    @Test
+    public void testScenario2_ScaleDownFrom5To3Workers() {
+        log.info("=== SCENARIO 2: Scale-Down (5→3 workers) ===");
+        
+        // Start with 5 workers, balanced
+        addNewEmptyWorkers("worker1", "worker2", "worker3", "worker4", "worker5");
+        addNewConnector("connector-1", 10);
+        performStandardRebalance();
+        performStandardRebalance();  // Ensure fully balanced
+        
+        log.info("Initial state (5 workers, 10 tasks):");
+        logAllAssignments();
+        assertBalancedDistribution(2, 2);
+        
+        // Track which tasks worker4 and worker5 had
+        Set<ConnectorTaskId> lostTasks = new HashSet<>();
+        lostTasks.addAll(memberAssignments.get("worker4").tasks());
+        lostTasks.addAll(memberAssignments.get("worker5").tasks());
+        int lostTaskCount = lostTasks.size();
+        
+        log.info("Tasks that will be lost: {}", lostTasks);
+        
+        // Remove 2 workers
+        removeWorkers("worker4", "worker5");
+        
+        log.info("After removing worker4 and worker5:");
+        logAllAssignments();
+        
+        // Round 2: Should only assign lost tasks (no revocations)
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Incremental Assignment):");
+        logAllAssignments();
+        
+        // Verify Round 2 only: Lost tasks assigned, no revocations
+        assertRound2Behavior(lostTaskCount, 0);
+        
+        // Verify no Round 1 happened (no revocations from existing workers)
+        // Each remaining worker should have gained some tasks, not lost any
+        
+        // Verify final balance: 3-4 tasks per worker (10 tasks / 3 workers)
+        assertBalancedDistribution(3, 4);
+        assertAllTasksAssigned();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 2 passed: Scale-down with minimal disruption");
+    }
+
+    // ==================== SCENARIO 3: Task Count Increase ====================
+    
+    /**
+     * Scenario 3: Task count increased (10→15 tasks)
+     * Expected Flow:
+     * - Round 1: SKIPPED (no empty workers)
+     * - Round 2: Assign 5 new tasks incrementally
+     * 
+     * Key: Existing 10 tasks preserved, only 5 new tasks assigned!
+     */
+    @Test
+    public void testScenario3_TaskCountIncrease() {
+        log.info("=== SCENARIO 3: Task Count Increase (10→15 tasks) ===");
+        
+        // Start with 3 workers, 10 tasks, balanced
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
+        addNewConnector("connector-1", 10);
+        performStandardRebalance();
+        performStandardRebalance();
+        
+        log.info("Initial state (3 workers, 10 tasks):");
+        logAllAssignments();
+        assertBalancedDistribution(3, 4);
+        
+        // Track existing tasks
+        Set<ConnectorTaskId> existingTasks = new HashSet<>();
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            existingTasks.addAll(assignment.tasks());
+        }
+        assertEquals(10, existingTasks.size());
+        
+        // Increase task count to 15 (5 new tasks)
+        connectors.put("connector-1", 15);
+        
+        log.info("After increasing connector-1 to 15 tasks:");
+        
+        // Round 2: Assign 5 new tasks only
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Incremental Assignment):");
+        logAllAssignments();
+        
+        // Verify Round 2 only: 5 new tasks assigned, no revocations
+        assertRound2Behavior(5, 0);
+        
+        // Verify all original 10 tasks are still assigned
+        Set<ConnectorTaskId> currentTasks = new HashSet<>();
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            currentTasks.addAll(assignment.tasks());
+        }
+        assertTrue("All original tasks should be preserved", 
+                currentTasks.containsAll(existingTasks));
+        
+        // Verify final balance: 5 tasks per worker (15 tasks / 3 workers)
+        assertBalancedDistribution(5, 5);
+        assertAllTasksAssigned();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 3 passed: Task count increase with preservation");
+    }
+
+    // ==================== SCENARIO 4: New Connector Added ====================
+    
+    /**
+     * Scenario 4a: New connector added (no empty workers created)
+     * Expected Flow:
+     * - Round 1: SKIPPED (no empty workers)
+     * - Round 2: Assign new connector's tasks
+     */
+    @Test
+    public void testScenario4a_NewConnectorAdded_NoEmptyWorkers() {
+        log.info("=== SCENARIO 4a: New Connector Added (no empty workers) ===");
+        
+        // Start with 3 workers, 1 connector with 10 tasks
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
+        addNewConnector("connector-1", 10);
+        performStandardRebalance();
+        performStandardRebalance();
+        
+        log.info("Initial state (1 connector, 10 tasks):");
+        logAllAssignments();
+        
+        // Add new connector with 5 tasks
+        addNewConnector("connector-2", 5);
+        
+        log.info("After adding connector-2 with 5 tasks:");
+        
+        // Round 2: Assign 5 new tasks
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Assignment):");
+        logAllAssignments();
+        
+        // Verify Round 2 only: 5 tasks assigned, no revocations
+        assertRound2Behavior(5, 0);
+        
+        // Verify final balance: 5 tasks per worker (15 tasks / 3 workers)
+        assertBalancedDistribution(5, 5);
+        assertAllTasksAssigned();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 4a passed: New connector added incrementally");
+    }
+
+    // ==================== SCENARIO 5: Connector Removed ====================
+    
+    /**
+     * Scenario 5: Connector removed
+     * Expected Flow:
+     * - Tasks from deleted connector automatically filtered out
+     * - Round 1: SKIPPED (no empty workers after removal)
+     * - Round 2: Rebalance remaining tasks if needed
+     */
+    @Test
+    public void testScenario5_ConnectorRemoved() {
+        log.info("=== SCENARIO 5: Connector Removed ===");
+        
+        // Start with 3 workers, 2 connectors
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
+        addNewConnector("connector-1", 10);
+        addNewConnector("connector-2", 5);
+        performStandardRebalance();
+        performStandardRebalance();
+        
+        log.info("Initial state (2 connectors, 15 tasks):");
+        logAllAssignments();
+        assertBalancedDistribution(5, 5);
+        
+        // Remove connector-2 (5 tasks)
+        connectors.remove("connector-2");
+        
+        log.info("After removing connector-2:");
+        
+        // Tasks should be automatically filtered out
+        performStandardRebalance();
+        
+        log.info("After rebalance:");
+        logAllAssignments();
+        
+        // Verify only connector-1 tasks remain
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            for (ConnectorTaskId task : assignment.tasks()) {
+                assertEquals("Only connector-1 tasks should remain", 
+                        "connector-1", task.connector());
+            }
+        }
+        
+        // Verify final balance: 3-4 tasks per worker (10 tasks / 3 workers)
+        assertBalancedDistribution(3, 4);
+        
+        // Total tasks should be 10 (connector-2's 5 tasks removed)
+        int totalTasks = memberAssignments.values().stream()
+                .mapToInt(a -> a.tasks().size())
+                .sum();
+        assertEquals(10, totalTasks);
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 5 passed: Connector removed and tasks filtered");
+    }
+
+    // ==================== SCENARIO 6: Task Count Decrease ====================
+    
+    /**
+     * Scenario 6: Task count decreased (10→6 tasks)
+     * Expected Flow:
+     * - Tasks with removed IDs automatically filtered out
+     * - Round 1: SKIPPED
+     * - Round 2: Rebalance remaining 6 tasks
+     */
+    @Test
+    public void testScenario6_TaskCountDecrease() {
+        log.info("=== SCENARIO 6: Task Count Decrease (10→6 tasks) ===");
+        
+        // Start with 3 workers, 10 tasks
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
+        addNewConnector("connector-1", 10);
+        performStandardRebalance();
+        performStandardRebalance();
+        
+        log.info("Initial state (3 workers, 10 tasks):");
+        logAllAssignments();
+        assertBalancedDistribution(3, 4);
+        
+        // Decrease task count to 6 (tasks 6-9 removed)
+        connectors.put("connector-1", 6);
+        
+        log.info("After decreasing connector-1 to 6 tasks:");
+        
+        // Round 1: Revoke all tasks (severe imbalance detected)
+        performStandardRebalance();
+        
+        log.info("After Round 1 (Revocation):");
+        logAllAssignments();
+        
+        // Round 2: Assign 6 tasks
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Assignment):");
+        logAllAssignments();
+        
+        // Verify only tasks 0-5 remain
+        Set<Integer> validTaskIds = new HashSet<>();
+        for (int i = 0; i < 6; i++) {
+            validTaskIds.add(i);
+        }
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            for (ConnectorTaskId task : assignment.tasks()) {
+                assertTrue("Only tasks 0-5 should remain, found: " + task.task(),
+                        validTaskIds.contains(task.task()));
+            }
+        }
+        
+        // Verify final balance: 2 tasks per worker (6 tasks / 3 workers)
+        assertBalancedDistribution(2, 2);
+        
+        // Total tasks should be 6
+        int totalTasks = memberAssignments.values().stream()
+                .mapToInt(a -> a.tasks().size())
+                .sum();
+        assertEquals(6, totalTasks);
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 6 passed: Task count decrease handled");
+    }
+
+    // ==================== SCENARIO 7: Severe Imbalance ====================
+    
+    /**
+     * Scenario 7: Severe imbalance triggering Round 1
+     * Expected Flow:
+     * - Round 1: Full revocation (worker exceeds globalMaxLimit)
+     * - Round 2: Complete redistribution
+     */
+    @Test
+    public void testScenario7_SevereImbalanceTriggeringRound1() {
+        log.info("=== SCENARIO 7: Severe Imbalance ===");
+        
+        // Setup: 3 workers with severe imbalance
+        // worker1: 8 tasks (way over limit)
+        // worker2: 1 task
+        // worker3: 1 task
+        // Total: 10 tasks, should be 3-4 each, limit should be ~4-5
+        
+        addNewConnector("connector-1", 10);
+        
+        List<ConnectorTaskId> worker1Tasks = createTaskIds("connector-1", 0, 1, 2, 3, 4, 5, 6, 7);
+        List<ConnectorTaskId> worker2Tasks = createTaskIds("connector-1", 8);
+        List<ConnectorTaskId> worker3Tasks = createTaskIds("connector-1", 9);
+        
         memberAssignments.put("worker1", new ConnectorsAndTasks.Builder()
-                .with(Collections.singletonList("C1-connector1"), worker1Tasks).build());
+                .with(Collections.singletonList("connector-1"), worker1Tasks).build());
         memberAssignments.put("worker2", new ConnectorsAndTasks.Builder()
                 .with(Collections.emptyList(), worker2Tasks).build());
         memberAssignments.put("worker3", new ConnectorsAndTasks.Builder()
-                .with(Collections.emptyList(), Collections.emptyList()).build());
+                .with(Collections.emptyList(), worker3Tasks).build());
         
         log.info("Initial imbalanced state:");
         logAllAssignments();
         
-        // Converge through multiple rounds
-        int maxRounds = 6;
-        for (int round = 1; round <= maxRounds; round++) {
-            performStandardRebalance();
-            
-            log.info("After Round {}:", round);
-            logAllAssignments();
-            
-            // Verify no duplicates after each round
-            assertNoDuplicateConnectorAssignments();
-            
-            // Check if balanced
-            if (isBalanced()) {
-                log.info("✓ Test 2 passed: Converged to balanced state in {} rounds", round);
-                assertAllTasksAssigned();
-                return;
-            }
-        }
+        // Round 1: Should trigger full revocation
+        performStandardRebalance();
         
-        fail("Failed to converge to balanced state after " + maxRounds + " rounds");
+        log.info("After Round 1 (Revocation):");
+        logAllAssignments();
+        
+        // Verify Round 1: All 10 tasks revoked
+        assertRound1Behavior(10, 0);
+        
+        // Round 2: Redistribute all tasks
+        performStandardRebalance();
+        
+        log.info("After Round 2 (Assignment):");
+        logAllAssignments();
+        
+        // Verify Round 2: All 10 tasks assigned
+        assertRound2Behavior(10, 0);
+        
+        // Verify final balance: 3-4 tasks per worker
+        assertBalancedDistribution(3, 4);
+        assertAllTasksAssigned();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
+        
+        log.info("✓ SCENARIO 7 passed: Severe imbalance corrected via Round 1");
     }
 
+    // ==================== Multi-Connector Scenarios ====================
+    
     /**
-     * Test 3: Worker leaving scenario
-     * - Start: 3 workers with balanced assignment
-     * - Remove worker3
-     * - Expected: Tasks redistributed to worker1 and worker2
+     * Scenario 8: Multi-connector balanced distribution
+     * Tests per-consumer fairness with multiple connectors
      */
     @Test
-    public void testWorkerLeaving() {
-        log.info("=== Test 3: Worker Leaving ===");
+    public void testScenario8_MultiConnectorBalance() {
+        log.info("=== SCENARIO 8: Multi-Connector Balance ===");
         
-        // Add connector and do initial assignment
-        addNewConnector("C1-connector1", 10);
+        // 3 workers, 3 connectors with different task counts
+        addNewEmptyWorkers("worker1", "worker2", "worker3");
+        addNewConnector("connector-1", 9);   // 3 per worker
+        addNewConnector("connector-2", 6);   // 2 per worker
+        addNewConnector("connector-3", 3);   // 1 per worker
+        
+        performStandardRebalance();
         performStandardRebalance();
         
-        log.info("Initial balanced state:");
-        logAllAssignments();
-        assertNoDuplicateConnectorAssignments();
-        
-        // Remove worker3
-        removeWorkers("worker3");
-        
-        log.info("After removing worker3:");
+        log.info("Final state (3 connectors, 18 tasks):");
         logAllAssignments();
         
-        // Rebalance
-        performStandardRebalance();
+        // Verify global balance: 6 tasks per worker
+        assertBalancedDistribution(6, 6);
         
-        log.info("After rebalancing:");
-        logAllAssignments();
-        
-        // Verify
-        assertNoDuplicateConnectorAssignments();
-        assertAllTasksAssigned();
-        
-        // Should be balanced between 2 workers (5 tasks each)
-        assertEquals(5, memberAssignments.get("worker1").tasks().size());
-        assertEquals(5, memberAssignments.get("worker2").tasks().size());
-        
-        log.info("✓ Test 3 passed: Worker leaving handled correctly");
-    }
-
-    /**
-     * Test 4: Worker joining scenario
-     * - Start: 2 workers with balanced assignment (5 tasks each)
-     * - Add worker3
-     * - Expected: Tasks redistributed to all 3 workers (3-4 each)
-     */
-    @Test
-    public void testWorkerJoining() {
-        log.info("=== Test 4: Worker Joining ===");
-        
-        // Start with only 2 workers
-        removeWorkers("worker3");
-        
-        // Add connector and do initial assignment
-        addNewConnector("C1-connector1", 10);
-        performStandardRebalance();
-        
-        log.info("Initial state with 2 workers:");
-        logAllAssignments();
-        assertNoDuplicateConnectorAssignments();
-        
-        // Add worker3
-        addNewEmptyWorkers("worker3");
-        
-        log.info("After adding worker3:");
-        logAllAssignments();
-        
-        // Rebalance (may take multiple rounds for cooperative protocol)
-        int maxRounds = 6;
-        for (int round = 1; round <= maxRounds; round++) {
-            performStandardRebalance();
+        // Verify per-connector balance
+        for (String worker : memberAssignments.keySet()) {
+            ConnectorsAndTasks assignment = memberAssignments.get(worker);
             
-            log.info("After rebalance round {}:", round);
-            logAllAssignments();
+            long c1Count = assignment.tasks().stream()
+                    .filter(t -> t.connector().equals("connector-1")).count();
+            long c2Count = assignment.tasks().stream()
+                    .filter(t -> t.connector().equals("connector-2")).count();
+            long c3Count = assignment.tasks().stream()
+                    .filter(t -> t.connector().equals("connector-3")).count();
             
-            assertNoDuplicateConnectorAssignments();
-            
-            // Check if all tasks assigned and balanced
-            try {
-                assertAllTasksAssigned();
-                if (isBalanced()) {
-                    log.info("✓ Test 4 passed: Worker joining handled correctly in {} rounds", round);
-                    return;
-                }
-            } catch (AssertionError e) {
-                if (round == maxRounds) {
-                    throw e;
-                }
-                log.debug("Round {}: Not yet fully assigned/balanced", round);
-            }
+            assertEquals("Each worker should have 3 connector-1 tasks", 3, c1Count);
+            assertEquals("Each worker should have 2 connector-2 tasks", 2, c2Count);
+            assertEquals("Each worker should have 1 connector-3 task", 1, c3Count);
         }
         
-        // Final verification
         assertAllTasksAssigned();
+        assertNoDuplicateConnectorAssignments();
+        assertAllConnectorsAssigned();
+        assertConnectorsEvenlyDistributed();
         
-        // Should be balanced across 3 workers (3-4 tasks each)
-        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
-            int taskCount = entry.getValue().tasks().size();
-            assertTrue("Worker " + entry.getKey() + " has " + taskCount + " tasks, expected 3-4",
-                    taskCount >= 3 && taskCount <= 4);
-        }
-        
-        log.info("✓ Test 4 passed: Worker joining handled correctly");
+        log.info("✓ SCENARIO 8 passed: Multi-connector per-consumer fairness");
     }
 
     // ==================== Helper Methods ====================
+
+    /**
+     * Verify Round 1 behavior: Only revocations, no assignments
+     */
+    private void assertRound1Behavior(int expectedRevocations, int expectedAssignments) {
+        assertEquals("Round 1 should have exactly " + expectedRevocations + " revocations",
+                expectedRevocations, countTotalRevocations());
+        assertEquals("Round 1 should have exactly " + expectedAssignments + " assignments (typically 0)",
+                expectedAssignments, countTotalAssignments());
+    }
+    
+    /**
+     * Verify Round 2 behavior: Only assignments, no revocations
+     */
+    private void assertRound2Behavior(int expectedAssignments, int expectedRevocations) {
+        assertEquals("Round 2 should have exactly " + expectedAssignments + " assignments",
+                expectedAssignments, countTotalAssignments());
+        assertEquals("Round 2 should have exactly " + expectedRevocations + " revocations (typically 0)",
+                expectedRevocations, countTotalRevocations());
+    }
+    
+    /**
+     * Count total revocations in the last ClusterAssignment (tasks only)
+     */
+    private int countTotalRevocations() {
+        if (returnedAssignments == null) {
+            return 0;
+        }
+        int total = 0;
+        for (String worker : returnedAssignments.allWorkers()) {
+            // Only count task revocations, not connector revocations
+            total += returnedAssignments.newlyRevokedTasks(worker).size();
+        }
+        return total;
+    }
+    
+    /**
+     * Count total assignments in the last ClusterAssignment (tasks only)
+     */
+    private int countTotalAssignments() {
+        if (returnedAssignments == null) {
+            return 0;
+        }
+        int total = 0;
+        for (String worker : returnedAssignments.allWorkers()) {
+            // Only count task assignments, not connector assignments
+            total += returnedAssignments.newlyAssignedTasks(worker).size();
+        }
+        return total;
+    }
+    
+    /**
+     * Verify balanced distribution within min/max range
+     */
+    private void assertBalancedDistribution(int minTasksPerWorker, int maxTasksPerWorker) {
+        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
+            int taskCount = entry.getValue().tasks().size();
+            assertTrue(
+                    String.format("Worker %s has %d tasks, expected [%d, %d]",
+                            entry.getKey(), taskCount, minTasksPerWorker, maxTasksPerWorker),
+                    taskCount >= minTasksPerWorker && taskCount <= maxTasksPerWorker
+            );
+        }
+    }
 
     private void performStandardRebalance() {
         performRebalance(false);
@@ -381,27 +757,24 @@ public class BalancedCooperativeAssignorTest {
         return tasks;
     }
 
-    private boolean isBalanced() {
-        if (memberAssignments.isEmpty()) {
-            return true;
-        }
-        
-        int minTasks = Integer.MAX_VALUE;
-        int maxTasks = 0;
-        
-        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
-            int taskCount = assignment.tasks().size();
-            minTasks = Math.min(minTasks, taskCount);
-            maxTasks = Math.max(maxTasks, taskCount);
-        }
-        
-        return (maxTasks - minTasks) <= 1;
-    }
-
     private void assertAllTasksAssigned() {
         Set<ConnectorTaskId> assignedTasks = new HashSet<>();
+        List<ConnectorTaskId> allTasksList = new ArrayList<>();
+        
         for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            allTasksList.addAll(assignment.tasks());
             assignedTasks.addAll(assignment.tasks());
+        }
+        
+        // Check for duplicate task assignments
+        if (allTasksList.size() != assignedTasks.size()) {
+            Map<ConnectorTaskId, Long> taskCounts = allTasksList.stream()
+                    .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+            List<String> duplicates = taskCounts.entrySet().stream()
+                    .filter(e -> e.getValue() > 1)
+                    .map(e -> e.getKey() + " assigned " + e.getValue() + " times")
+                    .collect(Collectors.toList());
+            fail("Found duplicate task assignments: " + String.join(", ", duplicates));
         }
         
         int expectedTasks = connectors.values().stream().mapToInt(Integer::intValue).sum();
@@ -427,6 +800,65 @@ public class BalancedCooperativeAssignorTest {
         
         if (!duplicates.isEmpty()) {
             fail("Found duplicate connector assignments: " + String.join(", ", duplicates));
+        }
+    }
+
+    private void assertAllConnectorsAssigned() {
+        Set<String> assignedConnectors = new HashSet<>();
+        List<String> allConnectorsList = new ArrayList<>();
+        
+        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
+            allConnectorsList.addAll(assignment.connectors());
+            assignedConnectors.addAll(assignment.connectors());
+        }
+        
+        // Check for duplicate connector assignments
+        if (allConnectorsList.size() != assignedConnectors.size()) {
+            Map<String, Long> connectorCounts = allConnectorsList.stream()
+                    .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()));
+            List<String> duplicates = connectorCounts.entrySet().stream()
+                    .filter(e -> e.getValue() > 1)
+                    .map(e -> e.getKey() + " assigned " + e.getValue() + " times")
+                    .collect(Collectors.toList());
+            fail("Found duplicate connector assignments: " + String.join(", ", duplicates));
+        }
+        
+        int expectedConnectors = connectors.size();
+        assertEquals("Not all connectors are assigned", expectedConnectors, assignedConnectors.size());
+        
+        // Verify each expected connector is assigned
+        for (String connector : connectors.keySet()) {
+            assertTrue("Connector " + connector + " is not assigned", assignedConnectors.contains(connector));
+        }
+    }
+
+    private void assertConnectorsEvenlyDistributed() {
+        if (memberAssignments.isEmpty() || connectors.isEmpty()) {
+            return; // Nothing to verify
+        }
+        
+        // Count connectors per worker
+        Map<String, Integer> connectorsPerWorker = new HashMap<>();
+        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
+            connectorsPerWorker.put(entry.getKey(), entry.getValue().connectors().size());
+        }
+        
+        int totalConnectors = connectors.size();
+        int numWorkers = memberAssignments.size();
+        int minExpected = totalConnectors / numWorkers;
+        int maxExpected = (totalConnectors + numWorkers - 1) / numWorkers; // Ceiling division
+        
+        log.info("Connector distribution check: {} connectors across {} workers (expected range: {}-{})",
+                totalConnectors, numWorkers, minExpected, maxExpected);
+        
+        for (Map.Entry<String, Integer> entry : connectorsPerWorker.entrySet()) {
+            int count = entry.getValue();
+            log.info("  {}: {} connectors", entry.getKey(), count);
+            
+            if (count < minExpected || count > maxExpected) {
+                fail(String.format("Worker %s has %d connectors, expected range [%d, %d]. Distribution: %s",
+                        entry.getKey(), count, minExpected, maxExpected, connectorsPerWorker));
+            }
         }
     }
 
