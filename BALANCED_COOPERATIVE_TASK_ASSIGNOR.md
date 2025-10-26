@@ -19,14 +19,14 @@ limitations under the License.
 
 ## Overview
 
-This algorithm provides a fast-converging, balanced task distribution strategy for Kafka Connect in distributed mode using the cooperative rebalancing protocol. It is specifically designed for large-scale, multi-tenant, spot-instance environments where fast convergence and per-consumer fairness are critical.
+This algorithm provides a balanced task distribution strategy for Kafka Connect in distributed mode using the cooperative rebalancing protocol. It is specifically designed for large-scale, multi-tenant, spot-instance environments where fast convergence and per-consumer fairness are critical.
 
 **Design Goals:**
-1. **Fast convergence**: Maximum 2 generations to reach perfect balance (vs 3+ with incremental approaches)
+
 2. **Per-consumer fairness**: Each consumer (connector) must be balanced across all workers
 3. **Global balance**: Total task load balanced across all workers
 4. **Minimal disruption**: Preserves existing assignments when possible (scale-down, task additions)
-5. **Spot-instance optimized**: Handles frequent worker churn efficiently
+5. **Autoscaling & Spot-instance Optimized**: Handles frequent worker scaling/churn efficiently
 
 ---
 
@@ -42,8 +42,8 @@ Throughout this document, we use the following example configuration:
 
 ### Task Distribution by Consumer
 
-| Consumer | Task Count | Tasks/Worker | consumerN_task_count_min | consumerN_task_count_max |
-|----------|------------|--------------|--------------------------|--------------------------|
+| Consumer | Task Count | Tasks/Worker | perConsumerPerWorkerTaskCountMin | perConsumerPerWorkerTaskCountMax |
+|----------|------------|--------------|----------------------------------|----------------------------------|
 | c1 | 111 | 11.1 | 11 | 12 |
 | c2 | 34 | 3.4 | 3 | 4 |
 | c3 | 14 | 1.4 | 1 | 2 |
@@ -57,116 +57,1184 @@ Throughout this document, we use the following example configuration:
 ### Target Calculations
 
 **Global Balance Targets:**
-- `globalMin` = floor(194/10) = **19** tasks per worker
-- `globalMax` = ceiling(194/10) = **20** tasks per worker
-- `globalMaxLimit` = globalMax + 1 = **21** tasks per worker (tolerance threshold)
+- `perWorkerTotalTasksMin` = floor(194/10) = **19** tasks per worker
+- `perWorkerTotalTasksMax` = ceiling(194/10) = **20** tasks per worker
+- `perWorkerTotalTasksMaxLimit` = perWorkerTotalTasksMax + 1 = **21** tasks per worker (tolerance threshold)
 
 **Per-Consumer Balance Targets:**
-- `consumerN_task_count_min` = floor(consumer_tasks / total_workers) - Minimum tasks each worker should have from consumer N
-- `consumerN_task_count_max` = ceiling(consumer_tasks / total_workers) - Maximum tasks each worker can have from consumer N
+- `perConsumerPerWorkerTaskCountMin` = floor(consumer_tasks / total_workers) - Minimum tasks each worker should have from consumer N
+- `perConsumerPerWorkerTaskCountMax` = ceiling(consumer_tasks / total_workers) - Maximum tasks each worker can have from consumer N
+- `maxNumberOfWorkersWithPerConsumerTaskCountMax` = (consumer_tasks - (perConsumerPerWorkerTaskCountMin × total_workers)) - Maximum number of workers in the cluster that should have perConsumerPerWorkerTaskCountMax from consumer N
 
 **Objective:** Achieve balanced distribution where:
-- Each worker has [globalMin, globalMax] total tasks
-- For each consumer N, each worker has [consumerN_task_count_min, consumerN_task_count_max] tasks from that consumer
+- Each worker has [perWorkerTotalTasksMin, perWorkerTotalTasksMax] total tasks
+- For each consumer N, each worker has [perConsumerPerWorkerTaskCountMin, perConsumerPerWorkerTaskCountMax] tasks from that consumer
+- At most `maxNumberOfWorkersWithPerConsumerTaskCountMax` workers can have perConsumerPerWorkerTaskCountMax tasks from consumer N
+- The remaining workers have perConsumerPerWorkerTaskCountMin tasks from consumer N
 
 ---
 ---
 
 ## Algorithm Structure
 
-The algorithm operates in two possible rounds:
+The algorithm operates using incremental cooperative rebalancing, where each generation performs **either** revocations **or** assignments, never both. This follows the core principle of the cooperative protocol.
 
-1. **Round 1 (Revocations)**: Full revocation of all tasks - triggered only on scale-up or severe imbalance
-2. **Round 2 (Complete Assignment)**: Assigns all unassigned tasks with perfect balance - always executes when tasks need redistribution
+**Key Principle:** Just as we assign tasks 1-at-a-time to achieve balance, we also revoke tasks 1-at-a-time in the reverse direction.
+
+### Cooperative Protocol Compliance
+
+**CRITICAL**: Each rebalance generation executes in this sequence:
+
+1. **Step 1 (ALWAYS)**: Calculate balance targets for current worker count
+2. **Step 2 (ALWAYS)**: Check for balance violations (global and per-consumer)
+3. **Step 3 (CONDITIONAL)**: Execute ONLY revocations if overload violations detected
+4. **Step 4 (CONDITIONAL)**: Execute ONLY assignments if underload violations detected OR unassigned tasks exist
+
+**Steps 3 and 4 are MUTUALLY EXCLUSIVE** - only one executes per generation, never both.
+
+### Operation Modes
+
+1. **Revocation Generation** (Step 3): Revokes tasks from overloaded workers when violations exceed thresholds
+2. **Assignment Generation** (Step 4): Assigns unassigned tasks to underloaded workers or fills deficits
 
 ### Maximum Convergence Time
-- **Scale-up scenarios**: 2 generations (Round 1 → Round 2)
-- **Scale-down scenarios**: 1 generation (Round 2 only)
-- **Task/connector changes**: 1-2 generations depending on whether Round 1 is triggered
+- **Balanced to balanced**: 0 generations (no rebalancing needed, Steps 1-2 detect no violations)
+- **Minor imbalances**: 1-N generations (incremental revocations until balanced)
+- **Scale-up scenarios**: N generations (incremental revocations, then assignments)
+- **Scale-down scenarios**: 1-N generations (incremental assignments of lost tasks)
+- **Task/connector changes**: 1-N generations (incremental adjustments)
+
+Where N is proportional to the degree of imbalance - the further from balance, the more generations needed.
 
 ---
 
-## Round 1: Revocation Phase
+## Generation Execution Model
 
-**Purpose:** Full revocation of all tasks to achieve optimal redistribution across ALL workers.
+### Understanding the 4-Step Process
 
-**Operation:** Revoke only (no assignments) - all workers end with zero tasks.
+Every rebalance generation in the BalancedCooperativeAssignor follows a strict 4-step execution model that ensures compliance with the cooperative rebalancing protocol:
 
-### Trigger Criteria
-
-Round 1 is triggered if **ANY** of these conditions are met:
-
-#### 1. Scale-Up Detection (Empty Workers)
 ```
-IF any worker has 0 assigned tasks
-  → TRIGGER Round 1
-```
-
-**Scenarios:**
-- New workers joined the cluster (10→12 workers)
-- New deployment with fresh workers
-- New connector added with many tasks creating empty workers
-
-**Why needed:** Without full revocation, new workers stay empty while existing workers remain loaded.
-
-**Example:**
-```
-Before: w0-w9 each have ~19 tasks, w10-w11 have 0 tasks
-After Round 1: All workers (w0-w11) have 0 tasks
-After Round 2: All workers (w0-w11) have ~16 tasks each
-```
-
-#### 2. Severe Imbalance Detection
-```
-IF any worker has > globalMaxLimit tasks
-  → TRIGGER Round 1
-```
-
-**Scenarios:**
-- Extreme load imbalance due to previous failures
-- Manual task assignment errors
-
-**Example:**
-```
-globalMaxLimit = 21
-Worker w0 has 30 tasks → TRIGGER Round 1
+┌─────────────────────────────────────────────────────────────────┐
+│                    EVERY GENERATION EXECUTES                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  STEP 1 (Always): Calculate Balance Targets                     │
+│  ├─ Global: perWorkerTotalTasksMin/Max/MaxLimit                │
+│  └─ Per-Consumer: perConsumerPerWorkerTaskCountMin/Max         │
+│                                                                  │
+│  STEP 2 (Always): Check for Balance Violations                  │
+│  ├─ Global: overloadedWorkers, underloadedWorkers              │
+│  ├─ Per-Consumer: consumerOverloads, consumerUnderloads        │
+│  └─ Unassigned: unassignedTasks                                │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│              CONDITIONAL EXECUTION (NEVER BOTH)                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  STEP 3 (If overload violations): REVOCATION GENERATION         │
+│  └─ Revoke excess tasks from violated workers                  │
+│  └─ Return revocations ONLY (no assignments)                   │
+│                                                                  │
+│            --- OR (MUTUALLY EXCLUSIVE) ---                      │
+│                                                                  │
+│  STEP 4 (If no overload violations): ASSIGNMENT GENERATION      │
+│  └─ Assign tasks to fill deficits and unassigned              │
+│  └─ Return assignments ONLY (no revocations)                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### What Does NOT Trigger Round 1
+### Cooperative Protocol Compliance
 
-Round 1 is **NOT** triggered for:
-- ❌ Worker scale-down (departed workers)
-- ❌ Task count increases (new tasks added to existing connector)
-- ❌ Task count decreases (tasks removed from existing connector)
-- ❌ Connector removal (deleted tasks filtered out automatically)
+The key insight is that **Steps 3 and 4 are mutually exclusive** - a single generation executes EITHER Step 3 OR Step 4, but NEVER both:
 
-These scenarios proceed **directly to Round 2** for incremental rebalancing.
+| Violation State | Steps Executed | Result |
+|----------------|----------------|--------|
+| Overload violations detected | Steps 1, 2, **3** | Revocations only |
+| No overload, but underload/unassigned | Steps 1, 2, **4** | Assignments only |
+| No violations, no unassigned | Steps 1, 2 | No changes |
 
-### Round 1 Output
+This design ensures:
+- ✅ **Cooperative Protocol Compliance**: Never revoke AND assign in same generation
+- ✅ **Prioritization**: Overload violations (Step 3) are fixed before assignments (Step 4)
+- ✅ **Consistency**: Every generation checks balance (Steps 1-2) before acting
+- ✅ **Incremental Progress**: Each generation makes targeted progress toward balance
+- ✅ **Predictability**: Clear decision tree based on violation types
 
-After Round 1 completes:
-- All tasks revoked from all workers
-- All tasks marked as "unassigned"
-- Ready for redistribution in Round 2
+### Data Flow Through Generations
+
+Understanding how data flows through the cooperative protocol:
+
+```
+Generation N starts:
+  ↓
+  IncrementalCooperativeAssignor.performAssignment() called
+  ├─ Input: allMemberMetadata (current worker assignments)
+  └─ Calls: BalancedCooperativeAssignor.performTaskAssignment()
+      ↓
+      STEP 1: Calculate balance targets based on current worker count
+      STEP 2: Detect violations by comparing current state to targets
+      ↓
+      IF overload violations:
+        STEP 3: Build revocation map (worker → tasks to revoke)
+        Return: ClusterAssignment with revocations only
+      ↓
+      ELSE IF underload violations OR unassigned tasks:
+        STEP 4: Build assignment map (worker → tasks to assign)
+        Return: ClusterAssignment with assignments only
+      ↓
+      ELSE:
+        Return: Empty ClusterAssignment (no changes)
+  ↓
+  Workers receive their assignments via onSyncGroupReceived()
+  Workers apply changes (stop revoked tasks OR start new tasks)
+  Workers rejoin cluster
+  ↓
+Generation N+1 starts with updated worker states...
+```
+
+### Key Variables Passed Between Steps
+
+Understanding what data is available at each step:
+
+**From Step 1 (Targets):**
+```java
+perWorkerTotalTasksMin          // floor(totalTasks / numWorkers)
+perWorkerTotalTasksMax          // ceiling(totalTasks / numWorkers)
+perWorkerTotalTasksMaxLimit     // perWorkerTotalTasksMax + 1
+
+For each consumer:
+  perConsumerPerWorkerTaskCountMin    // floor(consumerTasks / numWorkers)
+  perConsumerPerWorkerTaskCountMax    // ceiling(consumerTasks / numWorkers)
+  maxNumberOfWorkersWithPerConsumerTaskCountMax  // consumerTasks - (perConsumerPerWorkerTaskCountMin × numWorkers)
+                                                  // Maximum workers allowed to have perConsumerPerWorkerTaskCountMax tasks
+```
+
+**From Step 2 (Violations):**
+```java
+overloadedWorkers         // List<WorkerState> with totalTasks > maxLimit
+underloadedWorkers        // List<WorkerState> with totalTasks < min
+consumerOverloads         // List<(WorkerState, Consumer)> exceeding max
+consumerUnderloads        // List<(WorkerState, Consumer)> below min
+unassignedTasks           // Set<ConnectorTaskId> not yet assigned
+```
+
+**To Step 3 (Revocation) OR Step 4 (Assignment):**
+```java
+// Both steps receive:
+- Current worker states (from allMemberMetadata)
+- Balance targets (from Step 1)
+- Violation lists (from Step 2)
+
+// Step 3 produces:
+Map<String, Collection<ConnectorTaskId>> tasksToRevoke
+
+// Step 4 produces:
+Map<String, Collection<ConnectorTaskId>> tasksToAssign
+```
 
 ---
 
-## Scale-Down Handling (Special Case)
+## Incremental Rebalancing Logic with Intelligent Forecasting
 
-When workers **leave** the cluster, we do **NOT** trigger Round 1. Instead, we use a gentler incremental approach.
+**Purpose:** Incrementally achieve perfect balance by intelligently revoking from overloaded workers and assigning to underloaded workers, using forecasting to minimize total generations needed.
 
-### Process Flow
+**Core Insight:** Before taking any action, forecast the target balanced state. Then revoke or assign one task per consumer per worker at a time, re-sorting after each action, until the forecasted balanced state is achieved.
+
+### Enhanced Decision Tree for Each Generation
+
+**IMPORTANT**: Steps 1 and 2 execute on EVERY generation. Steps 3 and 4 are mutually exclusive - only ONE executes per generation based on violation type detected in Step 2.
+
+```
+For each generation:
+  ↓
+  ═══════════════════════════════════════════════════════════════
+  STEP 1 (ALWAYS EXECUTED): Calculate Balance Targets
+  ═══════════════════════════════════════════════════════════════
+  Calculate for current worker count:
+    - perWorkerTotalTasksMin = floor(totalTasks / numWorkers)
+    - perWorkerTotalTasksMax = ceiling(totalTasks / numWorkers)
+    - perWorkerTotalTasksMaxLimit = perWorkerTotalTasksMax + 1
+    - For each consumer:
+        * perConsumerPerWorkerTaskCountMin = floor(consumerTasks / numWorkers)
+        * perConsumerPerWorkerTaskCountMax = ceiling(consumerTasks / numWorkers)
+        * maxNumberOfWorkersWithPerConsumerTaskCountMax = consumerTasks - (perConsumerPerWorkerTaskCountMin × numWorkers)
+          (This is the maximum number of workers that should have perConsumerPerWorkerTaskCountMax tasks from this consumer)
+  ↓
+  ═══════════════════════════════════════════════════════════════
+  STEP 2 (ALWAYS EXECUTED): Check for Balance Violations
+  ═══════════════════════════════════════════════════════════════
+  Check TWO types of violations:
+     
+     A. Global Balance Violation Check:
+        overloadedWorkers = []
+        underloadedWorkers = []
+        
+        FOR each worker:
+          IF worker.totalTasks > perWorkerTotalTasksMaxLimit:
+            overloadedWorkers.add(worker)
+          ELSE IF worker.totalTasks < perWorkerTotalTasksMin:
+            underloadedWorkers.add(worker)
+     
+     B. Per-Consumer Balance Violation Check:
+        consumerOverloads = []   # (worker, consumer) pairs
+        consumerUnderloads = []  # (worker, consumer) pairs
+        
+        FOR each worker:
+          FOR each consumer on worker:
+            # Check if worker exceeds max for this consumer
+            IF worker.consumerTaskCount[consumer] > perConsumerPerWorkerTaskCountMax[consumer]:
+              consumerOverloads.add((worker, consumer))
+            
+            # Check if too many workers have max count for this consumer
+            ELSE IF worker.consumerTaskCount[consumer] == perConsumerPerWorkerTaskCountMax[consumer]:
+              # Count how many workers currently have max count for this consumer
+              workersWithMaxCount = countWorkersWithTaskCount(consumer, perConsumerPerWorkerTaskCountMax[consumer])
+              
+              IF workersWithMaxCount > maxNumberOfWorkersWithPerConsumerTaskCountMax[consumer]:
+                # Too many workers have max count - mark excess workers for revocation
+                # Select workers to revoke from (e.g., by total load or round-robin)
+                consumerOverloads.add((worker, consumer))
+            
+            # Check if worker is below min for this consumer
+            ELSE IF worker.consumerTaskCount[consumer] < perConsumerPerWorkerTaskCountMin[consumer]:
+              consumerUnderloads.add((worker, consumer))
+     
+     A. Global Balance Violation Check:
+        overloadedWorkers = []
+        underloadedWorkers = []
+        
+        FOR each worker:
+          IF worker.totalTasks > perWorkerTotalTasksMaxLimit:
+            → OVERLOAD VIOLATION: Add to overloadedWorkers
+            
+          IF worker.totalTasks < perWorkerTotalTasksMin:
+            → UNDERLOAD VIOLATION: Add to underloadedWorkers
+     
+     B. Per-Consumer Balance Violation Check:
+        consumerOverloads = []   # (worker, consumer) pairs
+        consumerUnderloads = []  # (worker, consumer) pairs
+        
+        FOR each worker:
+          FOR each consumer on worker:
+            IF worker.consumerTaskCount[consumer] > perConsumerPerWorkerTaskCountMax[consumer]:
+              → OVERLOAD VIOLATION: Add (worker, consumer) to consumerOverloads
+              
+            IF worker.consumerTaskCount[consumer] < perConsumerPerWorkerTaskCountMin[consumer]:
+              → UNDERLOAD VIOLATION: Add (worker, consumer) to consumerUnderloads
+     
+     C. Check for Unassigned Tasks:
+        unassignedTasks = getAllUnassignedTasks()
+     
+     IF overloadedWorkers.isEmpty() AND consumerOverloads.isEmpty() 
+        AND underloadedWorkers.isEmpty() AND consumerUnderloads.isEmpty()
+        AND unassignedTasks.isEmpty():
+       → NO ACTION: Cluster is perfectly balanced ✅
+       RETURN empty assignments and revocations
+       Workers continue with current assignments
+  ↓
+  ═══════════════════════════════════════════════════════════════
+  STEP 3 (CONDITIONAL - ONLY if overload violations detected):
+  REVOCATION GENERATION
+  ═══════════════════════════════════════════════════════════════
+     IF overloadedWorkers NOT empty OR consumerOverloads NOT empty:
+       → EXECUTE REVOCATION GENERATION:
+          
+          Purpose: Remove ALL excess tasks from overloaded workers in this generation
+          
+          Action A: Revoke from per-consumer overloads
+            FOR each (worker, consumer) in consumerOverloads:
+              excessCount = worker.consumerTaskCount[consumer] - perConsumerPerWorkerTaskCountMin[consumer]
+              Revoke ALL excessCount tasks of 'consumer' from 'worker'
+              Update worker state immediately
+          
+          Action B: Revoke from globally overloaded workers
+            FOR each worker in overloadedWorkers:
+              WHILE worker.totalTasks > perWorkerTotalTasksMin:
+                Select consumer with most tasks on worker
+                Revoke 1 task of that consumer from worker
+                Update worker state immediately
+                Re-check if worker still in overloadedWorkers list
+              # This continues until worker.totalTasks <= perWorkerTotalTasksMin
+          
+          Return: revocations ONLY (no assignments in this generation)
+          
+          Workers will:
+            - Stop ALL revoked tasks
+            - Rejoin cluster
+            - Next generation will re-run Steps 1-2 and proceed based on violations
+  ↓
+  ═══════════════════════════════════════════════════════════════
+  STEP 4 (CONDITIONAL - ONLY if no overload violations):
+  ASSIGNMENT GENERATION
+  ═══════════════════════════════════════════════════════════════
+     ELSE IF underloadedWorkers NOT empty OR consumerUnderloads NOT empty OR unassignedTasks NOT empty:
+       → EXECUTE ASSIGNMENT GENERATION:
+          
+          Purpose: Fill underloaded workers and assign unassigned tasks
+          
+          Phase A: Fill to minimum targets (skip if they are already met)
+            FOR each (worker, consumer) in consumerUnderloads:
+              deficitCount = perConsumerPerWorkerTaskCountMin[consumer] - worker.consumerTaskCount[consumer]
+              Assign deficitCount tasks of 'consumer' to 'worker' from unassigned pool
+              Update worker state immediately
+            
+            FOR each worker in underloadedWorkers: (skip if they are already met)
+              WHILE worker.totalTasks < perWorkerTotalTasksMin AND unassigned exist:
+                Select consumer with fewest tasks on worker
+                Assign 1 task of that consumer to worker
+                Update worker state immediately
+          
+          Phase B: Distribute remaining unassigned tasks
+            WHILE unassignedTasks NOT empty:
+              Select worker with lowest totalTasks (≤ perWorkerTotalTasksMax)
+              Select consumer with fewest tasks on that worker
+              Assign 1 task of consumer to worker
+              Update worker state immediately
+          
+          Return: assignments ONLY (no revocations in this generation)
+          
+          Workers will:
+            - Start newly assigned tasks
+            - Continue running
+            - Next generation will re-run Steps 1-2 and proceed based on violations
+  ↓
+  ═══════════════════════════════════════════════════════════════
+  GENERATION COMPLETE
+  ═══════════════════════════════════════════════════════════════
+  Workers apply changes (EITHER revocations OR assignments, never both)
+  Workers rejoin cluster for next generation
+  Next generation repeats from Step 1
+```
+
+### Intelligent Forecasting Strategy
+
+Before any revocation or assignment, the algorithm:
+
+1. **Calculates Target State:**
+   - For each worker: target total tasks in [perWorkerTotalTasksMin, perWorkerTotalTasksMax]
+   - For each consumer: target tasks per worker in [perConsumerPerWorkerTaskCountMin, perConsumerPerWorkerTaskCountMax]
+   - For each consumer: calculate `maxNumberOfWorkersWithPerConsumerTaskCountMax` to limit how many workers can have the maximum count
+
+2. **Projects Revocation Path:**
+   - Identifies which tasks need to move from which workers
+   - Prioritizes consumers that are furthest from balance
+   - Plans minimal revocations to reach target state
+   - **NEW**: Checks if too many workers have `perConsumerPerWorkerTaskCountMax` for any consumer
+
+3. **Validates Assignment Path:**
+   - Before assigning, forecasts if assignment moves toward balance
+   - Checks if assignment violates perWorkerTotalTasksMaxLimit or perConsumerPerWorkerTaskCountMax
+   - **NEW**: Checks if assignment would cause too many workers to have perConsumerPerWorkerTaskCountMax
+   - Only assigns if it improves balance metrics
+
+4. **Re-sorts After Each Action:**
+   - After each single task revocation/assignment
+   - Re-evaluates worker loads across all consumers
+   - Ensures fairness and balance throughout the process
+
+### Why Incremental Works Better
+
+| Aspect | Full Revocation (Old) | Incremental (New) |
+|--------|----------------------|-------------------|
+| **Disruption** | High - revokes ALL tasks | Minimal - revokes 1 task at a time |
+| **Convergence** | 2 generations (all revoke, then all assign) | N generations (gradual approach) |
+| **Cloud-native fit** | Poor - large disruption on spot termination | Excellent - graceful degradation |
+| **Protocol compliance** | Basic - uses 2 generations | Natural - follows cooperative philosophy |
+| **Fairness** | Eventual - only balanced after 2 rounds | Continuous - improves every generation |
+
+---
+
+## Revocation Generation with Intelligent Forecasting
+
+**Execution Context**: This is Step 3 in the generation cycle, executed ONLY when Step 2 detects overload violations.
+
+**Trigger Conditions (from Step 2):** 
+- `overloadedWorkers` list is NOT empty (workers with totalTasks > perWorkerTotalTasksMaxLimit)
+- OR `consumerOverloads` list is NOT empty (worker-consumer pairs exceeding perConsumerPerWorkerTaskCountMax)
+
+**Operation:** Revoke ALL excess tasks that violate limits, update worker state, return revocations only
+
+### Algorithm Flow (Step 3 - Revocation Generation)
+
+**Precondition**: Steps 1 and 2 have already executed, and overload violations were detected.
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 3: REVOCATION GENERATION (Only if overload violations)
+═══════════════════════════════════════════════════════════════
+
+GIVEN (from Step 2):
+  - overloadedWorkers = workers with totalTasks > perWorkerTotalTasksMaxLimit
+  - consumerOverloads = (worker, consumer) pairs with violations:
+      * worker.consumerTaskCount[consumer] > perConsumerPerWorkerTaskCountMax[consumer]
+      * OR worker has perConsumerPerWorkerTaskCountMax[consumer] tasks but total workers 
+        with this count > maxNumberOfWorkersWithPerConsumerTaskCountMax[consumer]
+  - Balance targets calculated in Step 1 (including maxNumberOfWorkersWithPerConsumerTaskCountMax for each consumer)
+
+1. Initialize revocation tracking:
+   revocations = empty map of (worker → list of tasks to revoke)
+   
+2. Revoke from per-consumer violations FIRST:
+   
+   # Sort by violation severity (most overloaded first)
+   sortedConsumerViolations = sort consumerOverloads by:
+     (actual_count - perConsumerPerWorkerTaskCountMin) descending
+   
+   FOR each (worker, consumer) in sortedConsumerViolations:
+     # Calculate exact excess beyond minimum threshold
+     excessCount = worker.consumerTaskCount[consumer] - perConsumerPerWorkerTaskCountMin[consumer]
+     
+     # Revoke ALL excess tasks from this consumer on this worker
+     FOR i = 1 to excessCount:
+       task = worker.selectTaskFromConsumer(consumer)
+       revocations[worker].add(task)
+       
+       # Update worker state immediately for next iteration
+       worker.consumerTaskCount[consumer] -= 1
+       worker.totalTasks -= 1
+       
+       LOG: "Revoking {task} from {worker} (consumer overload: {actual} > {min})"
+   
+3. Revoke from globally overloaded workers:
+   
+   # Some workers may still be overloaded globally even after per-consumer fixes
+   FOR each worker in overloadedWorkers:
+     WHILE worker.totalTasks > perWorkerTotalTasksMin:
+       # Select consumer with most tasks on this worker (spread the revocation)
+       consumer = selectConsumerWithMostTasksOnWorker(worker)
+       task = worker.selectTaskFromConsumer(consumer)
+       
+       revocations[worker].add(task)
+       
+       # Update worker state immediately
+       worker.consumerTaskCount[consumer] -= 1
+       worker.totalTasks -= 1
+       
+       LOG: "Revoking {task} from {worker} (global overload: {totalTasks} > {min})"
+     # This continues until worker.totalTasks <= perWorkerTotalTasksMin
+
+4. Return revocation assignments:
+   
+   Return ClusterAssignment with:
+     - newlyAssignedConnectors: empty
+     - newlyAssignedTasks: empty
+     - newlyRevokedConnectors: (as needed)
+     - newlyRevokedTasks: revocations
+     - allAssignedConnectors: (unchanged from current)
+     - allAssignedTasks: (current minus revocations)
+
+5. Workers apply revocations and rejoin:
+   
+   Each worker receives assignment with:
+     - Tasks to stop: revocations[worker]
+     - Tasks to start: (none - this is revocation-only generation)
+   
+   Workers will:
+     - Stop and cleanup revoked tasks
+     - Flush offsets and state
+     - Rejoin cluster for next generation
+     
+   Next generation will:
+     - Re-run Steps 1-2 (calculate targets and check violations)
+     - If still overloaded: repeat Step 3 (more revocations)
+     - If no longer overloaded but underloaded/unassigned: execute Step 4 (assignments)
+     - If balanced: no action
+
+═══════════════════════════════════════════════════════════════
+END OF STEP 3
+═══════════════════════════════════════════════════════════════
+```
+
+### Key Enhancements
+
+1. **Balance Check First:** Always verify if rebalancing is needed before taking action
+
+2. **Forecasting:** Calculate target state before revoking to know when to stop
+
+3. **Consumer-First Approach:** Revoke 1 task per consumer per worker (not just 1 task total)
+   - Ensures per-consumer balance improves every generation
+   - Prevents over-concentration on single consumer
+
+4. **Intelligent Sorting:** Re-sort after each revocation
+   - Maintains fairness across all workers
+   - Ensures next revocation targets most overloaded worker
+
+5. **Convergence Check:** After each revocation, check if consumer is now balanced
+   - Avoids unnecessary revocations
+   - Moves to next consumer once current is balanced
+
+### Revocation Priority Logic
+
+When selecting which task to revoke from a worker:
+
+```
+Priority order:
+1. Consumer with highest (actual_count - perConsumerPerWorkerTaskCountMax)
+   → Most overloaded consumer first
+   
+2. Within consumer, worker with highest consumerTaskCount
+   → Most loaded worker for that consumer first
+   
+3. Re-sort after each revocation
+   → Ensures fairness maintained throughout
+```
+
+### Revocation Example with Intelligent Forecasting
+
+**Scenario:** 10 workers, 194 tasks, worker w0 has 25 tasks (globalMax = 20), with per-consumer imbalance
+
+**Initial State:**
+```
+w0: 25 tasks total (15 c1, 6 c2, 2 c3, 2 c4) - OVERLOADED
+w1-w9: 19 tasks each (11 c1, 3 c2, 1 c3, 2 c4, 1 c5)
+
+Targets:
+  perWorkerTotalTasksMax = 20
+  c1: max = 12
+  c2: max = 4
+```
+
+**Generation 1 - Violation Detection and Revocation:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  perWorkerTotalTasksMin = floor(194/10) = 19
+  perWorkerTotalTasksMax = ceiling(194/10) = 20
+  perWorkerTotalTasksMaxLimit = 21
+  
+  Per-consumer targets:
+    c1: min=11, max=12
+    c2: min=3, max=4
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Global violations:
+    w0.totalTasks = 25 > perWorkerTotalTasksMaxLimit(21) → OVERLOAD ❌
+    overloadedWorkers = [w0]
+  
+  Per-consumer violations:
+    w0.c1Count = 15 > c1max(12) → OVERLOAD ❌
+    w0.c2Count = 6 > c2max(4) → OVERLOAD ❌
+    consumerOverloads = [(w0, c1), (w0, c2)]
+  
+  Decision: OVERLOAD VIOLATIONS DETECTED → Execute Step 3 (Revocation)
+
+═══════════════════════════════════════════════════════════════
+STEP 3: REVOCATION GENERATION
+═══════════════════════════════════════════════════════════════
+  Forecast Target State:
+    w0 should have: 20 total (12 c1, 4 c2)
+    Need to revoke: 5 tasks total (3 c1, 2 c2)
+  
+  Action: Revoke from per-consumer overloads first
+    c1 excess: 15 - 12 = 3 tasks to revoke
+    c2 excess: 6 - 4 = 2 tasks to revoke
+  
+  Revocations for Generation 1:
+    w0 → [c1-task-42, c1-task-43, c1-task-44, c2-task-15, c2-task-16]
+  
+  Result:
+    - Revocations: 5 tasks from w0
+    - Assignments: NONE (this is revocation-only generation)
+    - New state after revocation: w0=20 tasks (12 c1, 4 c2), 5 unassigned
+    
+  Workers rejoin and trigger Generation 2...
+```
+
+**Generation 2 - Balanced Check and Assignment:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  perWorkerTotalTasksMin = 19
+  perWorkerTotalTasksMax = 20
+  perWorkerTotalTasksMaxLimit = 21
+  (Targets unchanged - same worker count)
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Global violations:
+    All workers: 19-20 tasks → Within [19, 21] ✅
+    overloadedWorkers = [] (empty)
+  
+  Per-consumer violations:
+    All workers within [min, max] for each consumer ✅
+    consumerOverloads = [] (empty)
+  
+  Unassigned tasks:
+    5 tasks unassigned (from previous revocation)
+    unassignedTasks = [c1-task-42, c1-task-43, c1-task-44, c2-task-15, c2-task-16]
+  
+  Decision: NO OVERLOAD, BUT UNASSIGNED TASKS → Execute Step 4 (Assignment)
+
+═══════════════════════════════════════════════════════════════
+STEP 4: ASSIGNMENT GENERATION
+═══════════════════════════════════════════════════════════════
+  Phase A: No deficits (all workers ≥ min)
+  
+  Phase B: Distribute 5 unassigned tasks
+    Assign to workers with lowest total (currently 19 tasks):
+      w1 → c1-task-42 (now 20 tasks)
+      w2 → c1-task-43 (now 20 tasks)
+      w3 → c1-task-44 (now 20 tasks)
+      w4 → c2-task-15 (now 20 tasks)
+      w5 → c2-task-16 (now 20 tasks)
+  
+  Result:
+    - Revocations: NONE (this is assignment-only generation)
+    - Assignments: 5 tasks to w1-w5
+    - Final state: All workers 19-20 tasks, perfectly balanced ✅
+```
+
+**Final:** All workers at 19-20 tasks, per-consumer balanced
+
+**Key Observations:**
+- **Generation 1**: Steps 1-2 detected overload violations → Step 3 executed (revocations only)
+- **Generation 2**: Steps 1-2 detected no overload but unassigned tasks → Step 4 executed (assignments only)
+- **NEVER** revoked and assigned in the same generation
+- Total: 2 generations (1 revocation + 1 assignment)
+
+---
+
+### Example: maxNumberOfWorkersWithPerConsumerTaskCountMax Constraint
+
+**Scenario:** Consumer c9 with 1 task, 10 workers
+
+**Target Calculations:**
+```
+c9: 1 task total
+perConsumerPerWorkerTaskCountMin = floor(1/10) = 0
+perConsumerPerWorkerTaskCountMax = ceiling(1/10) = 1
+maxNumberOfWorkersWithPerConsumerTaskCountMax = 1 - (0 × 10) = 1
+
+This means: Only 1 worker should have 1 task from c9, the other 9 workers should have 0 tasks
+```
+
+**Violation Case (before fix):**
+```
+Initial state: 3 workers have 1 c9 task each (w0, w1, w2)
+Workers with max (1 task): 3
+maxNumberOfWorkersWithPerConsumerTaskCountMax: 1
+Violation: 3 > 1 ❌ (too many workers have the maximum)
+```
+
+**Generation N - Detection and Revocation:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  c9: min=0, max=1
+  maxNumberOfWorkersWithPerConsumerTaskCountMax = 1
+  (Only 1 worker should have 1 c9 task)
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Current c9 distribution:
+    w0: 1 c9 task
+    w1: 1 c9 task
+    w2: 1 c9 task
+    w3-w9: 0 c9 tasks
+  
+  Per-consumer violation check:
+    workersWithMaxCount = 3 (w0, w1, w2 all have 1 task)
+    maxNumberOfWorkersWithPerConsumerTaskCountMax[c9] = 1
+    
+    3 > 1 → VIOLATION ❌
+    
+  Decision: Mark (w1, c9) and (w2, c9) for revocation
+            (Keep w0 with the task, revoke from w1 and w2)
+
+═══════════════════════════════════════════════════════════════
+STEP 3: REVOCATION GENERATION
+═══════════════════════════════════════════════════════════════
+  Revoke 1 task from w1 (c9)
+  Revoke 1 task from w2 (c9)
+  
+  Result:
+    w0: 1 c9 task ✅
+    w1: 0 c9 tasks (task revoked)
+    w2: 0 c9 tasks (task revoked)
+    w3-w9: 0 c9 tasks
+    
+    workersWithMaxCount = 1 (only w0 has 1 task)
+    Balanced! ✅
+```
+
+**Why This Matters:**
+
+Without this constraint, the algorithm could incorrectly distribute small consumers across multiple workers:
+- ❌ **Without constraint**: c9's 1 task could end up on any worker, causing imbalance
+- ✅ **With constraint**: c9's 1 task stays on exactly 1 worker, maintaining perfect distribution
+
+This is especially important for small consumers (tasks ≤ workers) where task count doesn't evenly divide across all workers.
+
+### What Triggers Revocation Generation
+
+Revocation generation is triggered if **ANY** of these balance violations are detected:
+
+#### 1. Global Overload Violation
+```
+FOR each worker:
+  IF worker.totalTasks > perWorkerTotalTasksMaxLimit:
+    → REVOCATION GENERATION
+```
+
+**Why:** Worker is overloaded beyond the tolerance threshold and must shed ALL excess tasks down to perWorkerTotalTasksMin
+
+**Scenarios:**
+- Scale-up: Existing workers have more than new perWorkerTotalTasksMaxLimit
+- Failed rebalances: Some workers accumulated too many tasks
+- Manual errors: Incorrect assignments
+- Post-connector-deletion: Remaining tasks push worker over limit
+
+**Action:** Revoke tasks one at a time until worker.totalTasks <= perWorkerTotalTasksMin
+
+#### 2. Per-Consumer Overload Violation
+```
+FOR each worker:
+  FOR each consumer on worker:
+    IF worker.consumerTaskCount[consumer] > perConsumerPerWorkerTaskCountMin[consumer]:
+      → REVOCATION GENERATION
+```
+
+**Why:** Worker has too many tasks from a specific consumer and must shed ALL excess tasks down to perConsumerPerWorkerTaskCountMin for fairness
+
+**Scenarios:**
+- Connector task count increased, pushing existing workers over per-consumer min
+- Previous generation didn't fully balance per-consumer distribution
+- Scale-up reduced per-consumer max, but existing workers exceed new limit
+
+#### 3. Per-Consumer Distribution Violation (NEW)
+```
+FOR each consumer:
+  workersWithMaxCount = count of workers with perConsumerPerWorkerTaskCountMax tasks from this consumer
+  
+  IF workersWithMaxCount > maxNumberOfWorkersWithPerConsumerTaskCountMax:
+    → REVOCATION GENERATION
+```
+
+**Why:** Too many workers have the maximum task count for this consumer, violating the balanced distribution constraint
+
+**Scenarios:**
+- Small consumers (tasks ≤ workers): Ensures only the exact number of workers needed have tasks
+  - Example: c9 with 1 task, 10 workers → only 1 worker should have 1 task, not multiple workers
+- After scale-down: Remaining workers may all have max count when only some should
+- Previous generation over-distributed max tasks before checking constraint
+
+**Example:**
+```
+Consumer c2: 34 tasks, 10 workers
+  perConsumerPerWorkerTaskCountMin = 3
+  perConsumerPerWorkerTaskCountMax = 4
+  maxNumberOfWorkersWithPerConsumerTaskCountMax = 34 - (3 × 10) = 4
+  
+  Correct distribution: 4 workers with 4 tasks, 6 workers with 3 tasks
+  Violation: If 5+ workers have 4 tasks → triggers revocation
+```
+
+This constraint ensures mathematically perfect distribution where exactly the right number of workers have the maximum count.
+
+#### Critical Distinction: Violation-Based vs Traditional Triggers
+
+**OLD Approach (Round 1 Detection):**
+- Trigger: Empty worker detected (any worker has 0 tasks)
+- Action: Revoke ALL tasks from ALL workers
+
+**NEW Approach (Violation-Based):**
+- Trigger: Specific overload violations detected
+- Action: Revoke only from violating workers/consumers
+- Benefit: No unnecessary full revocations
+
+### What Does NOT Trigger Revocation Generation
+
+Revocation is **NOT** triggered for:
+- ✅ Worker scale-down (departed workers) → No overload violations, go directly to Assignment Generation
+- ✅ New tasks added to existing connector → No overload violations, go directly to Assignment Generation  
+- ✅ Connector removal (deleted tasks filtered out) → May trigger Assignment if rebalance needed
+- ✅ Workers within limits but below min → Underload violations only, go to Assignment Generation
+- ✅ Empty workers (new workers with 0 tasks) → Underload violations only, go to Assignment Generation
+
+**Key Principle:** Revocation is ONLY triggered when workers or consumers are **overloaded** (exceed max limits). 
+Underloaded workers (below min) are handled by Assignment Generation, not Revocation Generation.
+
+These scenarios have no overload violations, so they proceed directly to Assignment Generation.
+
+---
+
+## Assignment Generation with Intelligent Forecasting
+
+**Execution Context**: This is Step 4 in the generation cycle, executed ONLY when Step 2 detects NO overload violations AND (underload violations exist OR unassigned tasks exist).
+
+**Trigger Conditions (from Step 2):**
+- `overloadedWorkers` list IS empty AND `consumerOverloads` list IS empty (no overload violations)
+- AND at least ONE of:
+  - `underloadedWorkers` list is NOT empty (workers with totalTasks < perWorkerTotalTasksMin)
+  - OR `consumerUnderloads` list is NOT empty (worker-consumer pairs below perConsumerPerWorkerTaskCountMin)
+  - OR `unassignedTasks` set is NOT empty (tasks not yet assigned to any worker)
+
+**Operation:** Fill deficits to minimum targets, then distribute remaining unassigned tasks, return assignments only
+
+### Algorithm Flow (Step 4 - Assignment Generation)
+
+**Precondition**: Steps 1 and 2 have already executed, NO overload violations detected, but underload violations or unassigned tasks exist.
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 4: ASSIGNMENT GENERATION (Only if no overload violations)
+═══════════════════════════════════════════════════════════════
+
+GIVEN (from Step 2):
+  - underloadedWorkers = workers with totalTasks < perWorkerTotalTasksMin
+  - consumerUnderloads = (worker, consumer) pairs with count < perConsumerPerWorkerTaskCountMin
+  - unassignedTasks = tasks not assigned to any worker
+  - Balance targets calculated in Step 1
+  
+PRECONDITION CHECK:
+  overloadedWorkers IS empty ✅
+  consumerOverloads IS empty ✅
+  (This ensures we only assign, never revoke in this generation)
+
+1. Initialize assignment tracking:
+   assignments = empty map of (worker → list of tasks to assign)
+   
+2. PHASE A: Fill workers to minimum targets first
+   -------------------------------------------------------
+   
+   2a. Fill per-consumer deficits:
+       
+       # Sort by deficit severity (most underloaded first)
+       sortedConsumerUnderloads = sort consumerUnderloads by:
+         (perConsumerPerWorkerTaskCountMin - actual_count) descending
+       
+       FOR each (worker, consumer) in sortedConsumerUnderloads:
+         # Calculate exact deficit
+         deficitCount = perConsumerPerWorkerTaskCountMin[consumer] - worker.consumerTaskCount[consumer]
+         
+         # Assign up to deficitCount tasks from unassigned pool
+         tasksAvailable = unassignedTasks[consumer].size()
+         tasksToAssign = min(deficitCount, tasksAvailable)
+         
+         FOR i = 1 to tasksToAssign:
+           task = unassignedTasks[consumer].removeFirst()
+           assignments[worker].add(task)
+           
+           # Update worker state immediately for next iteration
+           worker.consumerTaskCount[consumer] += 1
+           worker.totalTasks += 1
+           
+           LOG: "Assigning {task} to {worker} (consumer deficit: {actual} < {min})"
+   
+   2b. Fill globally underloaded workers:
+       
+       FOR each worker in underloadedWorkers:
+         WHILE worker.totalTasks < perWorkerTotalTasksMin AND unassignedTasks NOT empty:
+           # Select consumer with fewest tasks on this worker (spread evenly)
+           consumer = selectConsumerWithFewestTasksOnWorker(worker)
+           
+           IF unassignedTasks[consumer].isEmpty():
+             CONTINUE to next consumer
+           
+           task = unassignedTasks[consumer].removeFirst()
+           assignments[worker].add(task)
+           
+           # Update worker state immediately
+           worker.consumerTaskCount[consumer] += 1
+           worker.totalTasks += 1
+           
+           LOG: "Assigning {task} to {worker} (global deficit: {totalTasks} < {min})"
+
+3. PHASE B: Distribute remaining unassigned tasks
+   -------------------------------------------------------
+   
+   WHILE unassignedTasks NOT empty:
+     # Find worker with lowest total tasks that's still below max
+     eligibleWorkers = workers where totalTasks ≤ perWorkerTotalTasksMax
+     
+     IF eligibleWorkers.isEmpty():
+       # All workers at max, but tasks remain
+       # This can happen when totalTasks > workers × perWorkerTotalTasksMax
+       LOG: "WARNING: All workers at max capacity, but {unassignedTasks.size()} tasks remain"
+       
+       # Force assignment to worker with fewest total tasks
+       worker = selectWorkerWithFewestTotalTasks()
+       LOG: "Force assigning to {worker} beyond max (totalTasks will be {worker.totalTasks + 1})"
+     ELSE:
+       worker = selectWorkerWithLowestTotalTasksFromEligible(eligibleWorkers)
+     
+     # Select consumer with fewest tasks on this worker (balance across consumers)
+     consumer = selectConsumerWithFewestTasksOnWorker(worker)
+     
+     IF unassignedTasks[consumer].isEmpty():
+       # This consumer has no more tasks, try next consumer
+       CONTINUE to next consumer with unassigned tasks
+     
+     # NEW: Check if assigning would violate maxNumberOfWorkersWithPerConsumerTaskCountMax
+     IF worker.consumerTaskCount[consumer] + 1 == perConsumerPerWorkerTaskCountMax[consumer]:
+       # This assignment would bring worker to max for this consumer
+       workersWithMaxCount = countWorkersWithTaskCount(consumer, perConsumerPerWorkerTaskCountMax[consumer])
+       
+       IF workersWithMaxCount >= maxNumberOfWorkersWithPerConsumerTaskCountMax[consumer]:
+         # Too many workers already have max - skip this worker for this consumer
+         LOG: "Skipping {worker} for {consumer} - would exceed maxNumberOfWorkersWithPerConsumerTaskCountMax"
+         CONTINUE to next eligible worker
+     
+     task = unassignedTasks[consumer].removeFirst()
+     assignments[worker].add(task)
+     
+     # Update worker state immediately
+     worker.consumerTaskCount[consumer] += 1
+     worker.totalTasks += 1
+     
+     LOG: "Assigning {task} to {worker} (distributing remaining: worker now has {totalTasks})"
+
+4. Return assignment:
+   
+   Return ClusterAssignment with:
+     - newlyAssignedConnectors: (as computed)
+     - newlyAssignedTasks: assignments
+     - newlyRevokedConnectors: empty
+     - newlyRevokedTasks: empty
+     - allAssignedConnectors: (current plus new assignments)
+     - allAssignedTasks: (current plus new assignments)
+
+5. Workers apply assignments and continue:
+   
+   Each worker receives assignment with:
+     - Tasks to start: assignments[worker]
+     - Tasks to stop: (none - this is assignment-only generation)
+   
+   Workers will:
+     - Start newly assigned tasks
+     - Continue running existing tasks
+     - No task disruption
+     
+   Next generation will:
+     - Re-run Steps 1-2 (calculate targets and check violations)
+     - If still underloaded/unassigned: repeat Step 4 (more assignments)
+     - If overloaded: execute Step 3 (revocations)
+     - If balanced: no action
+
+═══════════════════════════════════════════════════════════════
+END OF STEP 4
+═══════════════════════════════════════════════════════════════
+```
+
+### Key Enhancements
+
+1. **Violation-Based Triggering:** Assignment is triggered ONLY when violations detected
+   - Checks for underload violations (workers below perWorkerTotalTasksMin)
+   - Checks for per-consumer underload violations (below perConsumerPerWorkerTaskCountMin)
+   - Checks for unassigned tasks in the cluster
+   - No action if no violations and no unassigned tasks
+
+2. **Two-Phase Assignment:**
+   - **Phase A:** Fill underloaded workers/consumers to minimum targets
+   - **Phase B:** Distribute remaining unassigned tasks evenly across workers
+
+3. **Direct Deficit Filling:** Instead of 1 task per iteration, fills deficits directly
+   - Calculate exact deficit: `perConsumerPerWorkerTaskCountMin - actual_count`
+   - Assign multiple tasks at once to reach minimum targets
+   - More efficient than gradual incremental approach
+
+4. **Even Distribution:** Phase B assigns remaining tasks fairly
+   - Always assigns to worker with lowest total tasks (below max)
+   - Spreads tasks from each consumer evenly across workers
+   - Prevents over-concentration on single worker
+
+5. **Respects Limits:** Never violates maximum thresholds during assignment
+   - Global check: `worker.totalTasks ≤ perWorkerTotalTasksMax`
+   - Per-consumer check: `worker.consumerTaskCount ≤ perConsumerPerWorkerTaskCountMax`
+   - **NEW**: Per-consumer distribution check: Ensure workers with `perConsumerPerWorkerTaskCountMax` don't exceed `maxNumberOfWorkersWithPerConsumerTaskCountMax`
+   - Falls back to force assignment only if all workers at capacity
+
+### Assignment Priority Logic
+
+When selecting which worker to assign to:
+
+```
+Priority order:
+1. Workers below perConsumerPerWorkerTaskCountMin for the consumer
+   → Fill minimum guarantees first
+   
+2. Among eligible workers, choose worker with lowest totalTasks
+   → Maintain global balance
+   
+3. Re-sort after each assignment
+   → Ensures continuous balance improvement
+   
+4. Validate against forecasted target state
+   → Only assign if it moves toward balance
+```
+
+### Assignment Priority Strategy
+
+The assignment logic prioritizes:
+
+1. **Per-Consumer Targets First:** Fill workers to `perConsumerPerWorkerTaskCountMin` for each consumer
+2. **Global Balance:** Always assign to least-loaded worker (by total task count)
+3. **Fairness:** Rotate through consumers to avoid over-assigning one consumer
+4. **Small Consumer Protection:** Limit small connectors (tasks ≤ workers) to max 1 task per worker
+
+### Assignment Example: Scale-Down
+
+**Scenario:** 10 workers → 8 workers (w8, w9 terminated), 38 tasks lost
+
+**After Delayed Rebalance (30 seconds):**
+
+**Generation N - Violation Detection and Assignment:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  NEW worker count: 8 (down from 10)
+  Total tasks: 194 (unchanged)
+  
+  perWorkerTotalTasksMin = floor(194/8) = 24
+  perWorkerTotalTasksMax = ceiling(194/8) = 25
+  perWorkerTotalTasksMaxLimit = 26
+  
+  Per-consumer targets (updated for 8 workers):
+    c1: min=13, max=14 (was 11, 12 for 10 workers)
+    c2: min=4, max=5 (was 3, 4 for 10 workers)
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Current state:
+    w0-w7: each has 19-20 tasks (their previous assignments)
+    38 tasks unassigned (lost from w8, w9)
+  
+  Global violations:
+    All workers: 19-20 tasks < perWorkerTotalTasksMin(24) → UNDERLOAD ❌
+    underloadedWorkers = [w0, w1, w2, w3, w4, w5, w6, w7] (all 8 workers)
+    overloadedWorkers = [] (empty - no overload)
+  
+  Unassigned tasks:
+    38 tasks from departed workers
+    unassignedTasks.size() = 38
+  
+  Decision: NO OVERLOAD, BUT UNDERLOAD + UNASSIGNED → Execute Step 4 (Assignment)
+
+═══════════════════════════════════════════════════════════════
+STEP 4: ASSIGNMENT GENERATION
+═══════════════════════════════════════════════════════════════
+  Phase A: Fill workers to minimum (24 tasks per worker)
+    Each of 8 workers needs: 24 - 20 = 4-5 more tasks
+  
+  Phase B: Distribute 38 unassigned tasks across 8 workers
+    Round 1: Assign 1 task to each of 8 workers (8 tasks assigned, 30 remain)
+  
+  Result for Generation N:
+    - Revocations: NONE (this is assignment-only generation)
+    - Assignments: 8 tasks (1 to each worker)
+      w0 → c1-task-X, w1 → c1-task-Y, ..., w7 → c2-task-Z
+    - New state: w0-w7 now have 20-21 tasks each, 30 unassigned remain
+    
+  Workers continue running and trigger Generation N+1...
+```
+
+**Generation N+1 - Continue Assignment:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  Same as Generation N (worker count unchanged)
+  perWorkerTotalTasksMin = 24
+  perWorkerTotalTasksMax = 25
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Current state:
+    w0-w7: now have 20-21 tasks each
+    30 tasks still unassigned
+  
+  Global violations:
+    All workers: 20-21 < min(24) → Still UNDERLOAD ❌
+    underloadedWorkers = [w0, w1, w2, w3, w4, w5, w6, w7]
+  
+  Decision: NO OVERLOAD, BUT UNDERLOAD + UNASSIGNED → Execute Step 4 (Assignment)
+
+═══════════════════════════════════════════════════════════════
+STEP 4: ASSIGNMENT GENERATION
+═══════════════════════════════════════════════════════════════
+  Assign 1 task to each of 8 workers
+  
+  Result:
+    - Assignments: 8 tasks (1 to each worker)
+    - New state: w0-w7 now have 21-22 tasks, 22 unassigned remain
+```
+
+**Generation N+2 through N+4:**
+```
+Each generation:
+  - Steps 1-2: Calculate targets and detect underload violations
+  - Step 4: Assign 8 more tasks (1 per worker)
+Continue incrementally...
+```
+
+**Generation N+5 - Final Assignment:**
+
+```
+═══════════════════════════════════════════════════════════════
+STEP 1: Calculate Balance Targets
+═══════════════════════════════════════════════════════════════
+  perWorkerTotalTasksMin = 24
+  perWorkerTotalTasksMax = 25
+
+═══════════════════════════════════════════════════════════════
+STEP 2: Check for Violations
+═══════════════════════════════════════════════════════════════
+  Current state:
+    w0-w7: now have 23-24 tasks each
+    6 tasks still unassigned
+  
+  Global violations:
+    Most workers at or near min(24) ✓
+    underloadedWorkers = [subset with 23 tasks]
+  
+  Decision: Execute Step 4 (Assignment)
+
+═══════════════════════════════════════════════════════════════
+STEP 4: ASSIGNMENT GENERATION
+═══════════════════════════════════════════════════════════════
+  Assign final 6 tasks to workers with lowest count
+  
+  Result:
+    - Final state: w0-w7 each have 24-25 tasks (perfectly balanced) ✅
+```
+
+**Summary:**
+- Convergence: 5 generations (K = ceil(38/8) ≈ 5 generations)
+- Each generation: Steps 1-2 always execute, Step 4 assigns tasks
+- NO revocations (Step 3 never executed - no overload violations)
+- Existing 156 tasks undisturbed, only 38 lost tasks reassigned incrementally
+
+### Scale-Down Handling (Delayed Rebalance)
+
+When workers **leave** the cluster, we use delayed rebalancing followed by incremental Assignment Generations.
 
 #### Step 1: Delayed Rebalance Activation
 ```
 Detect workers left cluster
   ↓
-Start delayed rebalance timer (e.g., 5 minutes)
+Start delayed rebalance timer (configured value, e.g., 30 seconds)
   ↓
 During delay: No changes occur (allows workers to rejoin)
 ```
 
-**Configuration:** `scheduled.rebalance.max.delay.ms` (default: 5 minutes)
+**Configuration:** `scheduled.rebalance.max.delay.ms` (30000ms from deployment config)
 
 #### Step 2: After Delay Expires
 ```
@@ -174,422 +1242,110 @@ Lost tasks from departed workers → marked as unassigned
   ↓
 Recalculate targets for NEW worker count
   ↓
-Proceed directly to Round 2 (NO revocations)
+Proceed to Assignment Generation (NO revocations needed)
 ```
 
-**New Targets Calculation:**
-- New `globalMin`, `globalMax`, `globalMaxLimit` based on remaining workers
-- New `consumerN_task_count_min`, `consumerN_task_count_max` for each consumer based on remaining workers
+**Why No Revocations Needed:**
+- Remaining workers keep their current tasks
+- Only lost tasks need reassignment
+- Current worker loads are typically < new globalMin
 
-#### Step 3: Round 2 Incremental Assignment
-- **Phase A**: Fill remaining workers to NEW consumerN_task_count_min values
-- **Phase B**: Distribute lost tasks using 1-task-at-a-time logic
-- **Preservation**: Existing tasks on remaining workers stay assigned
+#### Step 3: Incremental Assignment Generations
+- Each generation assigns 1 task to each underloaded worker
+- Workers rejoin after each assignment
+- Continue until all lost tasks redistributed and balance achieved
 
-### Scale-Down Example
+### Assignment Example: New Tasks
 
-**Scenario:** 10 workers → 8 workers (w8, w9 terminated)
+**Scenario:** Connector c1 increased from 111 to 120 tasks (9 new tasks)
 
-#### Initial State (10 workers)
+**Generation N (Assignment):**
 ```
-w0-w9: each has 19-20 tasks (194 total)
-w8: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) + 0(c6-c9) = 19 tasks
-w9: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) + 0(c6-c9) = 19 tasks
-```
+Current: w0-w9 each have 19-20 tasks total
+Unassigned: 9 new c1 tasks
+New targets: globalMax=20 (rounded from 203/10)
+Per-consumer: c1max=12
 
-#### Event: w8, w9 Terminated
-```
-Lost tasks: 38 tasks
-Delayed rebalance: 5 minutes (no changes during this time)
-```
+Decision: 9 unassigned tasks exist, no overloaded workers
+Action: Assign 1 c1 task to workers with lowest c1 count
 
-#### After Delay Expires (8 workers remain)
-```
-Active workers: w0-w7
-Unassigned tasks: 38 tasks from w8, w9
-
-NEW Targets (8 workers):
-  globalMin = floor(194/8) = 24
-  globalMax = ceiling(194/8) = 25
-  c1: min=13, max=14 (was 11, 12 for 10 workers)
-  c2: min=4, max=5 (was 3, 4)
-  c3-c9: unchanged
-```
-
-#### Round 1 Check
-```
-Any empty workers? NO (w0-w7 still have tasks)
-Any overloaded workers? NO
-Result: SKIP Round 1
-```
-
-#### Round 2 Execution
-**Phase A - Fill to NEW consumerN_task_count_min:**
-```
-w0 current: 11 c1 tasks, NEW target: 13 c1 tasks → Assign 2 more c1 tasks
-w0 current: 3 c2 tasks, NEW target: 4 c2 tasks → Assign 1 more c2 task
-... (repeat for w1-w7)
-```
-
-**Phase B - Distribute Remaining:**
-```
-Sort workers by total load (ascending)
-Assign remaining tasks 1-at-a-time to least loaded workers
-```
-
-#### Final State (8 workers)
-```
-w0-w7: each has 24-25 tasks (perfectly balanced)
-Per-consumer: All within [consumerN_task_count_min, consumerN_task_count_max] for 8 workers
-Global: All within [24, 25]
-Convergence: 1 generation (no revocation needed)
-Disruption: Minimal (only 38 lost tasks reassigned)
-```
-
-### Why Different Handling?
-
-| Scenario | Approach | Reason |
-|----------|----------|--------|
-| **Scale-Up** | Full revocation (Round 1) | Must redistribute existing work to include new workers |
-| **Scale-Down** | Incremental assignment (Round 2 only) | Remaining workers naturally absorb lost tasks without disrupting existing assignments |
-
----
----
-
-## Round 2: Complete Assignment Phase
-
-**Purpose:** Assign all unassigned tasks with perfect per-consumer and global balance.
-
-**Operation:** Assignment only (no revocations) - consists of two sequential phases within a single generation.
-
-### Input: ConfigSnapshot
-
-Round 2 always operates on the current state from `ConfigBackingStore`:
-
-```java
-configSnapshot.connectors()           // Set of connectors that SHOULD exist
-configSnapshot.tasks(connector)       // Set of tasks that SHOULD be running for each connector
-memberAssignments                     // Current worker assignments (what IS running)
-```
-
-**Automatic Filtering:**
-- Any task in `memberAssignments` but NOT in `configSnapshot` → Automatically filtered out (deleted)
-- Any task in `configSnapshot` but NOT in `memberAssignments` → Marked as "unassigned"
-
-### Unassigned Tasks Sources
-
-Round 2 handles ALL unassigned tasks, regardless of source:
-
-| Source | Description | Example |
-|--------|-------------|---------|
-| **Round 1 Revocation** | All tasks revoked in Round 1 | Scale-up: 194 tasks unassigned |
-| **Worker Scale-Down** | Tasks from departed workers | 10→8 workers: 38 tasks lost |
-| **New Connector** | All tasks from new connector | connector-10 added: 50 new tasks |
-| **Task Count Increase** | New tasks from existing connector | c1: 111→120 tasks: 9 new tasks |
-| **Connector Removal** | Remaining tasks after deletion | After c9 removed: 193 tasks remain |
-| **Task Count Decrease** | Remaining tasks after deletion | c1: 111→100 tasks: 11 tasks removed |
-
-**Key Principle:** The same algorithm applies regardless of WHY tasks are unassigned.
-
----
-
-### Phase A: Fill to consumerN_task_count_min (Minimum Guarantee)
-
-**Goal:** Ensure every worker gets **at least** consumerN_task_count_min tasks from each consumer before distributing extras.
-
-**Strategy:** 1-task-at-a-time assignment with re-sorting to maintain perfect balance throughout.
-
-#### Algorithm Steps
-
-**Step 1: Identify Unassigned Tasks**
-```
-For each consumer in configSnapshot.connectors():
-  unassignedTasks[consumer] = configSnapshot.tasks(consumer) - memberAssignments.tasks(consumer)
-```
-
-**Examples by scenario:**
-- Scale-up: All 194 tasks (after Round 1 revocation)
-- Scale-down (10→8): 38 tasks from departed w8, w9
-- New connector: All 50 tasks from connector-10
-- Task increase (c1: 111→120): 9 new c1 tasks
-- Connector removed: Remaining 193 tasks (c9's 1 task filtered out)
-
-**Step 2: Calculate Current Targets**
-```
-globalMin = floor(totalTasks / currentWorkerCount)
-globalMax = ceiling(totalTasks / currentWorkerCount)
-globalMaxLimit = globalMax + 1
-
-For each consumer:
-  consumerN_task_count_min = floor(consumerTasks / currentWorkerCount)
-  consumerN_task_count_max = ceiling(consumerTasks / currentWorkerCount)
-```
-
-**Critical:** Use CURRENT worker count, not previous count!
-
-**Example after scale-down (10→8 workers):**
-```
-OLD targets (10 workers): c1min=11, c1max=12
-NEW targets (8 workers):  c1min=13, c1max=14
-```
-
-**Step 3: Sort Consumers by consumerN_task_count_max (Descending)**
-```
-Sort order: Consumers with highest consumerN_task_count_max first
-Example: c1(consumerN_task_count_max=12), c2(4), c3(2), c4(2), c5(2), c6(1), c7(1), c8(1), c9(1)
-```
-
-**Step 4: Fill to consumerN_task_count_min Per Consumer**
-```java
-for each consumer in sorted order:
-  if unassignedTasks[consumer].isEmpty():
-    skip to next consumer
-    
-  if consumerN_task_count_min == 0 for this consumer:
-    skip to next consumer  // Handle in Phase B
-    
-  while workers exist below consumerN_task_count_min for this consumer:
-    sort workers by totalTaskLoad (ascending - least loaded first)
-    
-    for each worker:
-      if worker.tasksFromConsumer < consumerN_task_count_min AND unassignedTasks remain:
-        assign EXACTLY 1 task to this worker
-        remove task from unassignedTasks
-        add task to worker's assignment
-        BREAK and re-sort  // Critical for balance!
-        
-    if no progress made:
-      break  // All workers at consumerN_task_count_min OR no tasks left
-```
-
-**Re-sorting is Critical:**
-```
-Why re-sort after each task?
-- Maintains global balance while filling per-consumer targets
-- Ensures we always assign to least-loaded worker
-- Prevents any worker from getting too far ahead
-
-Example:
-w0: 17 tasks, w1: 18 tasks, w2: 19 tasks
-Assign 1 task to w0 (least loaded)
-New state: w0: 18 tasks, w1: 18 tasks, w2: 19 tasks
-Re-sort: w0, w1 tied for least loaded
-Next task goes to w0 or w1
-```
-
-#### Phase A Output
-
-After Phase A completes:
-- ✅ Every worker has **at least** consumerN_task_count_min tasks from each consumer (where consumerN_task_count_min > 0)
-- ✅ Global balance maintained throughout (via re-sorting)
-- ✅ Remaining unassigned tasks ready for Phase B
-
-#### Phase A Example: Scale-Down (10→8 workers)
-
-**Initial State:**
-```
-w0 has: 11 c1 tasks (OLD c1min was 11)
-NEW c1min = 13 (for 8 workers)
-Gap: Need 2 more c1 tasks
-```
-
-**Phase A Execution:**
-```
-Consumer c1:
-  w0: 11 c1 tasks → Assign 1 → 12 c1 tasks (re-sort)
-  w1: 11 c1 tasks → Assign 1 → 12 c1 tasks (re-sort)
-  ... continue until all workers at c1min=13
-
-Consumer c2:
-  Similar process to reach c2min=4
+Result:
+  Revocations: (none)
+  Assignments: 9 workers each get 1 new c1 task
   
-... continue for all consumers with consumerN_task_count_min > 0
+Final: All workers 20-21 tasks, perfectly balanced
+Convergence: 1 generation (all 9 tasks assigned to different workers)
 ```
-
-**After Phase A:**
-```
-w0-w7: Each worker closer to 24 tasks
-Per-consumer: All workers at or near consumerN_task_count_min for each consumer
-```
-```
-
-**After Phase A:**
-```
-w0-w7: Each worker closer to 24 tasks
-Per-consumer: All workers at or near consumerN_task_count_min for each consumer
-```
-
----
-
-### Phase B: Distribute Remaining Tasks
-
-**Goal:** Distribute all remaining unassigned tasks while respecting consumerN_task_count_max and globalMaxLimit.
-
-**Strategy:** 1-task-at-a-time assignment to least-loaded eligible workers.
-
-#### Algorithm Steps
-
-**Step 1: Check for Remaining Tasks**
-```
-if unassignedTasks is empty:
-  return complete assignments  // Phase B done!
-```
-
-**Step 2: Sort Consumers by Remaining Task Count (Descending)**
-```
-Sort consumers by unassignedTasks[consumer].size(), largest first
-Priority to consumers with most remaining tasks
-```
-
-**Step 3: Distribute Per Consumer**
-```java
-for each consumer in sorted order:
-  remainingTasks = unassignedTasks[consumer]
-  isSmallConsumer = (totalTasksForConsumer <= numWorkers)
-  
-  while remainingTasks not empty:
-    sort workers by totalTaskLoad (ascending - least loaded first)
-    
-    find first eligible worker where:
-      ✓ worker.totalTasks < globalMaxLimit
-      ✓ worker.tasksFromConsumer < consumerN_task_count_max
-      ✓ if isSmallConsumer: worker.tasksFromConsumer < 1  // Max 1 task per worker
-      
-    if no eligible worker found:
-      if isSmallConsumer:
-        log.warning("All workers have 1 task from small consumer")  // Expected
-      else:
-        log.error("No eligible worker found")  // Should not happen!
-      break to next consumer
-      
-    assign EXACTLY 1 task to eligible worker
-    remove from remainingTasks
-    add to worker's assignment
-    continue (re-sort for next iteration)
-```
-
-**Step 4: Return Complete Cluster Assignment**
-```
-All tasks assigned
-Perfect per-consumer and global balance achieved
-```
-
-#### Special Handling: Small Consumers
-
-**Definition:** Consumers with tasks <= workers (e.g., c6-c9 in our example)
-
-**Behavior:**
-- **Phase A**: Skipped (consumerN_task_count_min = 0)
-- **Phase B**: Max 1 task per worker enforced
-
-**Why?** Ensures fair distribution when fewer tasks than workers exist.
-
-**Example:**
-```
-c9 has 1 task, 10 workers
-Without limit: 1 worker gets the task, 9 workers get nothing ✓
-With our limit: 1 worker gets 1 task, enforced by Phase B ✓
-```
-
-#### Phase B Example: Scale-Down (10→8 workers)
-
-**After Phase A:**
-```
-w0-w7: Each has ~22-23 tasks
-Unassigned: Some tasks remaining from 38 lost tasks
-```
-
-**Phase B Execution:**
-```
-Sort consumers by remaining unassigned count
-For each consumer with remaining tasks:
-  Sort workers: [w0: 22 tasks, w1: 22 tasks, w2: 23 tasks, ...]
-  
-  Assign 1 task to w0 (least loaded)
-  New state: [w0: 23 tasks, w1: 22 tasks, w2: 23 tasks, ...]
-  
-  Re-sort: [w1: 22 tasks, w3: 22 tasks, w0: 23 tasks, ...]
-  Assign 1 task to w1
-  
-  Continue until all remaining tasks assigned
-```
-
-**Final State:**
-```
-w0-w7: Each has 24-25 tasks (perfectly balanced)
-Per-consumer: All within [consumerN_task_count_min, consumerN_task_count_max]
-Global: All within [globalMin, globalMax]
-```
-
----
-
----
 
 ## Complete Examples with Actual Task Counts
 
-### Example 1: Scale-Up Scenario (0→10 workers or 10→12 workers)
+### Example 1: Scale-Up Scenario (10→12 workers)
 
 #### Scenario
-- **Before**: 0 workers (or 10 workers with 194 tasks)
-- **After**: 10 workers (or 12 workers)
+- **Before**: 10 workers with 194 tasks (perfectly balanced at 19-20 tasks per worker)
+- **After**: 12 workers (2 new workers joined: w10, w11)
 - **Total tasks**: 194
 
-#### Round 1: Full Revocation
+#### Initial State (10 workers)
 ```
-Trigger: Empty workers detected (new workers have 0 tasks)
-Action: Revoke all 194 tasks from all workers
-Result: All tasks unassigned, ready for Round 2
-```
-
-#### Round 2 Phase A: Fill to consumerN_task_count_min
-
-**Targets for 10 workers:**
-- c1: min=11, max=12
-- c2: min=3, max=4
-- c3: min=1, max=2
-- c4: min=1, max=2
-- c5: min=1, max=2
-- c6-c9: min=0, max=1
-
-**Assignment:**
-```
-Phase A assigns: 110(c1) + 30(c2) + 10(c3) + 10(c4) + 10(c5) = 170 tasks
-
-Per worker after Phase A:
-  11(c1) + 3(c2) + 1(c3) + 1(c4) + 1(c5) = 17 tasks each
+w0-w9: each has 19-20 tasks (balanced for 10 workers)
+NEW: w10, w11 have 0 tasks each
 ```
 
-#### Round 2 Phase B: Distribute Remaining
-
-**Remaining unassigned:**
+#### New Targets (12 workers)
 ```
-c1: 1 task
-c2: 4 tasks
-c3: 4 tasks
-c4: 2 tasks
-c5: 1 task
-c6: 6 tasks
-c7: 4 tasks
-c8: 2 tasks
-c9: 1 task
-Total: 24 tasks
+perWorkerTotalTasksMin = floor(194/12) = 16
+perWorkerTotalTasksMax = ceiling(194/12) = 17
+perWorkerTotalTasksMaxLimit = 18
+
+Per-consumer:
+  c1: min=9, max=10 (was 11, 12)
+  c2: min=2, max=3 (was 3, 4)
+  c3-c5: min=1, max=2 (was 1, 2)
+  c6-c9: min=0, max=1 (unchanged)
 ```
 
-**Assignment:**
-```
-Distribute 1 task at a time to least-loaded workers
-Respecting consumerN_task_count_max and globalMaxLimit constraints
+#### Rebalancing Process (Incremental Revocations + Assignments)
 
-Final distribution:
-  4 workers @ 20 tasks
-  6 workers @ 19 tasks
+**Generation 1 (Revocation):**
+```
+Current: w0-w9 have 19-20 tasks (all > perWorkerTotalTasksMax=17), w10-w11 have 0
+Decision: Workers w0-w9 are overloaded
+Action: Revoke 1 task from each of w0-w9
+
+Result:
+  Revocations: w0→revoke 1 task, w1→revoke 1 task, ..., w9→revoke 1 task
+  Total revoked: 10 tasks
+  New state: w0-w9 have 18-19 tasks, w10-w11 have 0 tasks, 10 unassigned
 ```
 
-#### Final State
+**Generation 2 (Assignment):**
 ```
-Per-consumer balanced: ✅ All consumers within [consumerN_task_count_min, consumerN_task_count_max]
-Globally balanced: ✅ All workers within [19, 20]
-Convergence: 2 generations (Round 1 → Round 2)
+Current: 10 unassigned tasks, w10-w11 are underloaded
+Decision: Assign to underloaded workers
+Action: Assign 1 task to each of w10-w11, then to least loaded of w0-w9
+
+Result:
+  Assignments: w10→1 task, w11→1 task, and 8 more to w0-w7
+  New state: w0-w7 have 19-20, w8-w9 have 18-19, w10-w11 have 1, all balanced
+```
+
+**Generation 3 (Revocation):**
+```
+Current: Some workers still > perWorkerTotalTasksMax=17
+Decision: Continue revoking from overloaded workers
+Action: Revoke 1 task from each overloaded worker
+
+...continue for N more generations...
+```
+
+**Final State (after ~5-7 generations):**
+```
+w0-w11: Each has 16-17 tasks (perfectly balanced)
+Per-consumer balanced: ✅ All within [perConsumerPerWorkerTaskCountMin, perConsumerPerWorkerTaskCountMax]
+Globally balanced: ✅ All workers within [16, 17]
+Convergence: ~5-7 generations (incremental revocations and assignments)
+Disruption: Gradual - only ~3-4 tasks revoked per worker over multiple generations
 ```
 
 ---
@@ -598,33 +1354,24 @@ Convergence: 2 generations (Round 1 → Round 2)
 
 #### Initial State (10 workers, 194 tasks)
 ```
-Workers: w0, w1, w2, w3, w4, w5, w6, w7, w8, w9
+Workers: w0-w9
 Each worker: 19-20 tasks (perfectly balanced)
 
-w8 tasks: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) + 0(c6) + 0(c7) + 0(c8) + 0(c9) = 19 tasks
-w9 tasks: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) + 0(c6) + 0(c7) + 0(c8) + 0(c9) = 19 tasks
+w8: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) = 19 tasks
+w9: 11(c1) + 4(c2) + 1(c3) + 2(c4) + 1(c5) = 19 tasks
 ```
 
 #### Event: Workers Terminated
 ```
-w8 terminated → 19 tasks lost
-w9 terminated → 19 tasks lost
-Total lost: 38 tasks
-```
-
-#### Delayed Rebalance (5 minutes)
-```
-Time 0:00 - Workers w8, w9 left detected
-Time 0:00 - Delayed rebalance timer started (5 minutes)
-Time 0:00 to 4:59 - No changes occur (waiting for workers to rejoin)
-Time 5:00 - Delayed rebalance expires
+w8, w9 terminated → 38 tasks lost
+Delayed rebalance: 30 seconds (waiting for rejoin)
 ```
 
 #### After Delay Expires (8 workers remain)
 
 **Active workers:**
 ```
-w0-w7 (still running with their existing tasks)
+w0-w7 (still running with existing tasks)
 ```
 
 **Unassigned tasks:**
@@ -640,64 +1387,54 @@ w0-w7 (still running with their existing tasks)
 **NEW Targets (8 workers, 194 tasks):**
 ```
 Global:
-  globalMin = floor(194/8) = 24
-  globalMax = ceiling(194/8) = 25
-  globalMaxLimit = 26
+  perWorkerTotalTasksMin = floor(194/8) = 24
+  perWorkerTotalTasksMax = ceiling(194/8) = 25
+  perWorkerTotalTasksMaxLimit = 26
 
 Per-Consumer:
   c1: min=13, max=14 (was 11, 12)
   c2: min=4, max=5 (was 3, 4)
-  c3: min=1, max=2 (unchanged)
-  c4: min=1, max=2 (unchanged)
-  c5: min=1, max=2 (unchanged)
+  c3-c5: min=1, max=2 (unchanged)
   c6-c9: min=0, max=1 (unchanged)
 ```
 
-#### Round 1 Check
-```
-Any empty workers? NO (w0-w7 still have 19-20 tasks each)
-Any overloaded workers? NO (all under limit)
-Result: SKIP Round 1 ✅
-```
+#### Rebalancing Process (No Revocations Needed)
 
-#### Round 2 Phase A: Fill to NEW consumerN_task_count_min
-
-**Current state vs NEW targets:**
+**Check for Revocations:**
 ```
-w0 current: 11 c1 tasks, NEW c1min=13 → Need 2 more c1 tasks
-w0 current: 3 c2 tasks, NEW c2min=4 → Need 1 more c2 task
-w0 current: 1 c3 task, NEW c3min=1 → Already at minimum ✓
-... (similar for w1-w7)
+Any empty workers? NO (w0-w7 have 19-20 tasks)
+Any overloaded workers? NO (all have 19-20, which is < perWorkerTotalTasksMaxLimit=26)
+Result: Skip Revocation, go directly to Assignment
 ```
 
-**Assignment process:**
+**Generation 1 (Assignment):**
 ```
-For consumer c1:
-  Sort workers by total load: [w0: 19, w1: 19, w2: 20, ...]
-  Assign 1 c1 task to w0 → w0: 20 tasks
-  Re-sort: [w1: 19, w3: 19, w0: 20, w2: 20, ...]
-  Assign 1 c1 task to w1 → w1: 20 tasks
-  Continue until all workers have c1min=13
+Current: w0-w7 have 19-20 tasks each (all underloaded vs globalMin=24)
+Unassigned: 38 tasks
+Decision: Assign to underloaded workers
+Action: Assign 1 task to each of 8 workers
 
-For consumer c2:
-  Similar process to reach c2min=4
-
-After Phase A:
-  w0-w7: Each worker now has 22-23 tasks
+Result:
+  Assignments: w0→c1-task-X, w1→c1-task-Y, ..., w7→c2-task-Z
+  New state: w0-w7 have 20-21 tasks, 30 unassigned remain
 ```
 
-#### Round 2 Phase B: Distribute Remaining
-
-**Remaining unassigned:** Few tasks left after Phase A
-
-**Assignment:**
+**Generation 2 (Assignment):**
 ```
-Sort workers by total load
-Assign 1 task at a time to least-loaded workers
-Continue until all 38 tasks distributed
+Current: w0-w7 have 20-21 tasks (still underloaded)
+Unassigned: 30 tasks
+Action: Assign 1 task to each of 8 workers
+
+Result:
+  New state: w0-w7 have 21-22 tasks, 22 unassigned remain
 ```
 
-#### Final State (8 workers, 194 tasks)
+**Generation 3-5 (Assignments):**
+```
+Continue assigning 1 task per worker per generation...
+```
+
+**Final State (Generation 5):**
 ```
 Workers: w0-w7
 Each worker: 24-25 tasks (perfectly balanced)
@@ -711,8 +1448,8 @@ Per-consumer balance:
 Global balance:
   All workers within [24, 25] ✅
 
-Convergence: 1 generation (Round 2 only, no revocation)
-Disruption: Minimal (only 38 lost tasks reassigned, 156 existing tasks preserved)
+Convergence: 5 generations (incremental assignments, ceil(38/8) = 5)
+Disruption: None to existing 156 tasks, only 38 lost tasks reassigned incrementally
 ```
 
 ---
@@ -727,623 +1464,379 @@ c1 distribution: 11-12 c1 tasks per worker (111 total)
 
 Perfectly balanced for 194 tasks:
   c1min=11, c1max=12
-  globalMin=19, globalMax=20
+  perWorkerTotalTasksMin=19, perWorkerTotalTasksMax=20
 ```
 
 #### Event: Task Count Increased
 ```
 User action: Update connector-1 config
-  tasks.max: 110 → 120
+  tasks.max: 111 → 120
 
-Connector action: Generate 9 additional task configs
-  Tasks: connector-1-0 through connector-1-119
-
-ConfigBackingStore: Write new task configs
-
-Trigger: onTaskConfigUpdate() fires
-  needsReconfigRebalance = true
-  Rebalance triggered
+Connector generates 9 additional tasks
+ConfigBackingStore writes new task configs
+Rebalance triggered
 ```
 
-#### During Rebalance
-
-**ConfigSnapshot changes:**
+#### New State
 ```
-configSnapshot.tasks("connector-1") now returns 120 tasks (was 111)
-configuredTasks now has 203 total tasks (was 194)
-```
-
-**Current assignments:**
-```
-memberAssignments shows 194 tasks assigned
-  111 c1 tasks distributed across workers
-  83 other tasks distributed
+ConfigSnapshot: c1 now has 120 tasks
+Unassigned: 9 new c1 tasks
+Total tasks: 203 (194 + 9)
 ```
 
-**Unassigned tasks:**
-```
-9 new c1 tasks (connector-1-111 through connector-1-119)
-```
-
-#### Recalculate Targets (10 workers, 203 total tasks)
-
-**NEW Targets:**
+#### New Targets (10 workers, 203 tasks)
 ```
 Global:
-  globalMin = floor(203/10) = 20
-  globalMax = ceiling(203/10) = 21
-  globalMaxLimit = 22
+  perWorkerTotalTasksMin = floor(203/10) = 20
+  perWorkerTotalTasksMax = ceiling(203/10) = 21
+  perWorkerTotalTasksMaxLimit = 22
 
-c1 (120 tasks):
-  c1min = floor(120/10) = 12 (was 11)
-  c1max = ceiling(120/10) = 12 (was 12)
-
-Other consumers: Unchanged
+Per-Consumer c1:
+  c1min = floor(120/10) = 12
+  c1max = ceiling(120/10) = 12
 ```
 
-#### Round 1 Check
+#### Rebalancing Process
+
+**Check for Revocations:**
 ```
-Any empty workers? NO (all workers have 19-20 tasks)
-Any overloaded workers? NO (all under limit)
-Result: SKIP Round 1 ✅
+Any overloaded workers? w0-w9 have 19-20 (all ≤ perWorkerTotalTasksMaxLimit=22)
+Result: No revocations needed, go to Assignment
 ```
 
-#### Round 2 Phase A: Fill to NEW consumerN_task_count_min
-
-**Current state vs NEW c1min:**
+**Generation 1 (Assignment):**
 ```
-c1min changed: 11 → 12
+Current: w0-w9 have 19-20 tasks total, 11-12 c1 tasks each
+Unassigned: 9 new c1 tasks
+Decision: Assign new c1 tasks to workers with lowest c1 count
 
-Workers with 11 c1 tasks: Need 1 more c1 task
-```
-```
-c1min changed: 11 → 12
+Action: Assign 1 task to each worker with only 11 c1 tasks
 
-Workers with 11 c1 tasks: Need 1 more c1 task
-Workers with 12 c1 tasks: Already at new c1min ✓
-```
-
-**Assignment:**
-```
-Sort workers by total load: [w0: 19 (11 c1), w1: 20 (12 c1), w2: 19 (11 c1), ...]
-
-Assign 1 c1 task to w0 → w0: 20 tasks (12 c1)
-Re-sort: [w2: 19 (11 c1), w4: 19 (11 c1), w0: 20 (12 c1), ...]
-Assign 1 c1 task to w2 → w2: 20 tasks (12 c1)
-Continue for all workers below c1min
-
-After Phase A:
-  All workers have 12 c1 tasks (c1min reached)
-  Some tasks may remain if not all workers needed filling
+Result:
+  9 workers get 1 new c1 task each
+  All workers now have 20-21 total tasks
+  All workers now have 12 c1 tasks
+  Perfectly balanced!
 ```
 
-#### Round 2 Phase B: Distribute Remaining (if any)
-```
-If any c1 tasks remain unassigned:
-  Sort workers by total load
-  Assign 1 task at a time to least-loaded workers
-  Respecting c1max=12 and globalMaxLimit=22
-```
-
-#### Final State (10 workers, 203 total tasks)
+**Final State:**
 ```
 Workers: w0-w9
-Each worker: 20-21 tasks total (perfectly balanced)
+Each worker: 20-21 tasks total ✅
+Each worker: 12 c1 tasks ✅
 
-c1 distribution:
-  Each worker: 12 c1 tasks (120 total) ✅
-
-Global balance:
-  All workers within [20, 21] ✅
-
-Convergence: 1 generation (Round 2 only, incremental)
-Disruption: Minimal (only 9 new c1 tasks assigned, 111 existing c1 tasks unchanged)
+Convergence: 1 generation (all 9 tasks assigned simultaneously to different workers)
+Disruption: Zero - only new tasks assigned, no revocations
 ```
 
 ---
 
----
+## Summary: Incremental Cooperative Rebalancing with Intelligent Forecasting
 
-## Convergence Guarantees
+### Core Principle
 
-### Maximum Generations to Converge
+**Forecast target state, then revoke/assign 1 task per consumer per worker at a time, re-sorting after each action.**
 
-| Scenario | Generations | Path |
-|----------|-------------|------|
-| Scale-up (empty workers) | **2** | Round 1 (Revoke) → Round 2 (Assign) |
-| Scale-down (workers left) | **1** | Round 2 (Incremental Assign) |
-| Task count increase | **1** | Round 2 (Incremental Assign) |
-| New connector added | **1-2** | If creates empty workers: R1+R2, else R2 only |
-| Connector/task removal | **1** | Round 2 (Rebalance remaining) |
+This creates a truly intelligent incremental rebalancing protocol that:
+- Forecasts the target balanced state before taking action
+- Checks balance before rebalancing (avoids unnecessary work)
+- Revokes/assigns 1 task per consumer per worker (not just 1 task total)
+- Re-sorts cluster state after each action
+- Respects the cooperative protocol's constraint (revoke OR assign per generation, not both)
+- Maintains continuous balance improvement every generation
+- Prioritizes per-consumer balance (reaches perConsumerPerWorkerTaskCountMin before distributing extras)
 
-**Comparison:** This algorithm converges in maximum 2 generations, compared to 3+ generations with traditional incremental approaches.
+### Comparison: Old vs Enhanced Approach
 
-### Balance Constraints Enforced
+| Aspect | Old (Simple Incremental) | New (Intelligent Forecasting) |
+|--------|------------------------|-------------------|
+| **Balance Check** | Implicit | Explicit - checks before acting |
+| **Forecasting** | None | Projects target state before revoking/assigning |
+| **Revocation Unit** | 1 task per worker | 1 task **per consumer** per worker |
+| **Assignment Unit** | 1 task per worker | 1 task **per consumer** per worker |
+| **Sorting Frequency** | Once per generation | After **each** revocation/assignment |
+| **Priority Strategy** | Simple round-robin | Consumer-first with severity ordering |
+| **Convergence** | N generations | Optimized N (forecasted path) |
+| **Per-Consumer Balance** | Eventually achieved | Prioritized in every action |
+| **Disruption** | Minimal | Minimal + Intelligent |
 
-#### Per-Consumer Balance
-```
-For each consumer N and each worker W:
-  consumerN_task_count_min ≤ worker.tasksFromConsumer(N) ≤ consumerN_task_count_max
+### Benefits of Intelligent Forecasting Approach
 
-where:
-  consumerN_task_count_min = floor(consumerN_totalTasks / totalWorkers)
-  consumerN_task_count_max = ceiling(consumerN_totalTasks / totalWorkers)
-```
+1. **Faster Convergence**
+   - Forecasting identifies exact actions needed
+   - No wasted revocations or assignments
+   - Optimal path to balanced state
 
-**Example (c1 with 111 tasks, 10 workers):**
-```
-c1min = floor(111/10) = 11
-c1max = ceiling(111/10) = 12
-Result: Each worker has 11 or 12 c1 tasks ✅
-```
+2. **Superior Per-Consumer Fairness**
+   - 1 task per consumer per worker ensures balanced growth/shrinkage
+   - Prevents over-concentration on single consumer
+   - Phase A ensures consumerNTaskCountMin reached before Phase B
+   - **NEW**: `maxNumberOfWorkersWithPerConsumerTaskCountMax` ensures mathematically perfect distribution
 
-#### Global Balance
-```
-For each worker W:
-  globalMin ≤ worker.totalTasks ≤ globalMax
+3. **Continuous Re-sorting**
+   - After each single task movement
+   - Maintains global fairness throughout process
+   - Always assigns to least-loaded eligible worker
 
-where:
-  globalMin = floor(totalTasks / totalWorkers)
-  globalMax = ceiling(totalTasks / totalWorkers)
-```
+4. **Intelligent Prioritization**
+   - Revokes from most overloaded consumers first
+   - Assigns to consumers furthest from perConsumerPerWorkerTaskCountMin first
+   - Optimizes for both global and per-consumer balance simultaneously
+   - **NEW**: Prevents over-distribution of max task counts
 
-**Example (194 tasks, 10 workers):**
-```
-globalMin = floor(194/10) = 19
-globalMax = ceiling(194/10) = 20
-Result: Each worker has 19 or 20 total tasks ✅
-```
+5. **Avoids Unnecessary Rebalancing**
+   - Balance check at start of each generation
+   - Only acts if truly needed
+   - Saves cluster resources
 
-#### Small Consumer Fairness
-```
-For consumers with (totalTasks ≤ totalWorkers):
-  Each worker gets at most 1 task from that consumer
-```
+6. **Predictable Forecasting**
+   - Projects target state before acting
+   - Clear visibility into how many generations needed
+   - Easy to monitor and reason about
+   - **NEW**: Enforces exact distribution constraints for perfect balance
 
-**Example (c9 with 1 task, 10 workers):**
-```
-1 worker gets 1 c9 task
-9 workers get 0 c9 tasks
-Result: Fair distribution achieved ✅
-```
+### When to Use Each Generation Type
 
----
+| Current State | Violation Check Result | Action | Generation Type |
+|---------------|----------------------|--------|-----------------|
+| All workers within [perWorkerTotalTasksMin, perWorkerTotalTasksMaxLimit]<br>All consumers within [perConsumerPerWorkerTaskCountMin, perConsumerPerWorkerTaskCountMax]<br>All consumers respect maxNumberOfWorkersWithPerConsumerTaskCountMax<br>No unassigned tasks | ✅ NO VIOLATIONS | No action | **No Rebalance** |
+| Workers with totalTasks > perWorkerTotalTasksMaxLimit<br>OR consumers with count > perConsumerPerWorkerTaskCountMax<br>OR consumers with workersWithMaxCount > maxNumberOfWorkersWithPerConsumerTaskCountMax | ❌ OVERLOAD VIOLATIONS | Revoke ALL excess tasks from violated workers/consumers<br>Revoke excess max-count workers to meet constraint<br>Sort by violation severity<br>Return revocations only | **Revocation** |
+| Workers with totalTasks < perWorkerTotalTasksMin<br>OR consumers with count < perConsumerPerWorkerTaskCountMin<br>OR unassigned tasks exist | ❌ UNDERLOAD VIOLATIONS | Phase A: Fill deficits to reach min targets<br>Phase B: Distribute remaining unassigned tasks<br>Respect maxNumberOfWorkersWithPerConsumerTaskCountMax during assignment<br>Return assignments only | **Assignment** |
 
-## ClusterAssignment Tracking
+### Algorithm Flow Per Generation
 
-The algorithm maintains consistency through the `ClusterAssignment` object across all rounds:
-
-### Round 1 Tracking
-```java
-ClusterAssignment {
-  revocations: Map<Worker, List<Task>>  // All tasks from all workers
-  assignments: Map<Worker, List<Task>>  // Empty (no assignments in Round 1)
-}
-```
-
-**Example:**
-```
-Round 1 revokes:
-  w0: [c1-0, c1-1, c2-0, ...] → 19 tasks revoked
-  w1: [c1-2, c1-3, c2-1, ...] → 20 tasks revoked
-  ... (all workers)
-```
-
-### Round 2 Tracking
-```java
-ClusterAssignment {
-  revocations: Map<Worker, List<Task>>  // Empty (no revocations in Round 2)
-  assignments: Map<Worker, List<Task>>  // All new assignments from Phase A + Phase B
-}
-```
-
-**Example:**
-```
-Round 2 assigns:
-  w0: [c1-0, c1-1, ..., c2-0, ...] → 20 tasks assigned
-  w1: [c1-10, c1-11, ..., c2-5, ...] → 19 tasks assigned
-  ... (all workers)
-```
-
-### Consistency Rules
-
-**When revoking:**
-```
-1. Remove task from worker's assigned list
-2. Add task to unassigned pool
-3. Record revocation in ClusterAssignment
-```
-
-**When assigning:**
-```
-1. Remove task from unassigned pool
-2. Add task to worker's assigned list
-3. Record assignment in ClusterAssignment
-```
-
-**Invariants maintained:**
-- ✅ No task is assigned to multiple workers
-- ✅ No task is both assigned and unassigned
-- ✅ All tasks are accounted for (assigned + unassigned = totalTasks)
-
----
-
-## Algorithm Decision Tree
-
-Every rebalance follows this decision flow:
+**CRITICAL**: Steps 1-2 execute EVERY generation. Steps 3-4 are mutually exclusive based on Step 2's violation detection.
 
 ```
-┌─────────────────────────────────────────┐
-│ Rebalance Triggered                     │
-│ (Worker join/leave, connector/task     │
-│  changes, config updates)               │
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│ Step 1: Build Current State             │
-│                                         │
-│ • configuredConnectors =                │
-│     configSnapshot.connectors()         │
-│ • configuredTasks =                     │
-│     configSnapshot.tasks(connector)     │
-│ • memberAssignments =                   │
-│     current worker assignments          │
-│ • Filter deleted tasks automatically    │
-└──────────────┬──────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────┐
-│ Step 2: Check Round 1 Triggers          │
-└──────────────┬──────────────────────────┘
-               │
-     ┌─────────┴─────────┐
-     │                   │
-     ▼                   ▼
-┌─────────────┐     ┌──────────────┐
-│ Any worker  │     │ Any worker   │
-│ has 0 tasks?│     │ > maxLimit?  │
-└──────┬──────┘     └──────┬───────┘
-       │                   │
-   YES │               YES │
-       │                   │
-       └────────┬──────────┘
-                │ NO to both
-                ▼
-        ┌───────────────┐
-        │  TRIGGER      │
-        │  Round 1?     │
-        └───┬───────┬───┘
-            │       │
-         YES│       │NO
-            │       │
-            ▼       ▼
-  ┌──────────────┐  ┌──────────────┐
-  │  Round 1:    │  │  Skip        │
-  │  Revoke All  │  │  Round 1     │
-  └──────┬───────┘  └──────┬───────┘
-         │                 │
-         └────────┬────────┘
-                  │
-                  ▼
-        ┌──────────────────┐
-        │  Round 2:        │
-        │  Phase A + B     │
-        └─────────┬────────┘
-                  │
-                  ▼
-        ┌──────────────────┐
-        │  Cluster         │
-        │  Balanced!       │
-        └──────────────────┘
-```
-
-### Scenario Mappings
-
-```
-Worker Scale-Up (10→12)
-  └─> Empty workers detected
-      └─> Round 1: Revoke all
-          └─> Round 2: Redistribute all
-              └─> 2 generations
-
-Worker Scale-Down (10→8)
-  └─> No empty workers
-      └─> Skip Round 1
-          └─> Round 2: Assign lost tasks
-              └─> 1 generation
-
-New Connector Added
-  └─> Check if creates empty workers
-      ├─> YES: Round 1 + Round 2 (2 generations)
-      └─> NO: Round 2 only (1 generation)
-
-Connector Removed
-  └─> Tasks filtered out automatically
-      └─> Skip Round 1
-          └─> Round 2: Rebalance remaining
-              └─> 1 generation
-
-Task Count Increased
-  └─> No empty workers
-      └─> Skip Round 1
-          └─> Round 2: Assign new tasks
-              └─> 1 generation
-
-Task Count Decreased
-  └─> Tasks filtered out automatically
-      └─> Skip Round 1
-          └─> Round 2: Rebalance if needed
-              └─> 1 generation
-```
-
----
-
----
-
-## Handling Connector and Task Changes
-
-### How Changes Flow Through the System
-
-All connector and task changes flow through the cooperative protocol infrastructure:
-
-```
-User Action (REST API)
-    ↓
-ConfigBackingStore (Kafka topic)
-    ↓
-ConfigUpdateListener (all workers)
-    ↓
-needsReconfigRebalance = true
-    ↓
-member.requestRejoin()
-    ↓
-performTaskAssignment() with fresh configSnapshot
-```
-
-### Change Scenarios
-
-#### 1. New Connector Added
-
-**Flow:**
-```
-POST /connectors API
+START Generation N
   ↓
-ConfigBackingStore adds connector + tasks
+═══════════════════════════════════════════════════════════════
+STEP 1 (ALWAYS EXECUTED): Calculate Targets
+═══════════════════════════════════════════════════════════════
+   Calculate for current worker count:
+     - perWorkerTotalTasksMin = floor(totalTasks / numWorkers)
+     - perWorkerTotalTasksMax = ceiling(totalTasks / numWorkers)
+     - perWorkerTotalTasksMaxLimit = perWorkerTotalTasksMax + 1
+     
+     For each consumer:
+       - perConsumerPerWorkerTaskCountMin = floor(consumerTasks / numWorkers)
+       - perConsumerPerWorkerTaskCountMax = ceiling(consumerTasks / numWorkers)
   ↓
-ConfigUpdateListener.onConnectorConfigUpdate()
-  ↓
-needsReconfigRebalance = true (connector doesn't exist yet)
-  ↓
-Rebalance triggered
-```
-
-**In Algorithm:**
-```java
-configuredConnectors = configSnapshot.connectors()  // Includes new connector
-configuredTasks = configSnapshot.tasks(connector)   // Includes all new tasks
-```
-
-**Result:**
-- New connector's tasks appear as "unassigned"
-- Flow: Round 1 (if creates empty workers) → Round 2 (assign new tasks)
-- Convergence: 1-2 generations
-
-**Example:**
-```
-Before: 9 connectors, 194 tasks
-Action: Add connector-10 with 50 tasks
-After: 10 connectors, 244 tasks
-Algorithm: Round 2 assigns 50 new tasks incrementally
-```
-
-#### 2. Connector Removed
-
-**Flow:**
-```
-DELETE /connectors/{name} API
-  ↓
-ConfigBackingStore removes connector + tasks
-  ↓
-ConfigUpdateListener.onConnectorConfigRemove()
-  ↓
-needsReconfigRebalance = true
-  ↓
-Rebalance triggered
-```
-
-**In Algorithm:**
-```java
-configuredConnectors = configSnapshot.connectors()  // Excludes deleted connector
-configuredTasks = configSnapshot.tasks(connector)   // Excludes deleted tasks
-
-// Automatic filtering:
-finalTasks.removeIf(task -> !configuredConnectors.contains(task.connector()))
-```
-
-**Result:**
-- Deleted tasks automatically filtered from all worker assignments
-- Remaining tasks rebalanced if needed
-- Flow: Round 2 only (deleted tasks already gone)
-- Convergence: 1 generation
-
-**Example:**
-```
-Before: 9 connectors, 194 tasks (c9 has 1 task)
-Action: Delete connector c9
-After: 8 connectors, 193 tasks
-Algorithm: Round 2 rebalances remaining 193 tasks if imbalance exists
-```
-
-#### 3. Task Count Increased (tasks.max ↑)
-
-**Flow:**
-```
-PUT /connectors/{name}/config with higher tasks.max
-  ↓
-Worker calls connector.taskConfigs(maxTasks)
-  ↓
-Connector generates additional task configs
-  ↓
-ConfigBackingStore.putTaskConfigs()
-  ↓
-ConfigUpdateListener.onTaskConfigUpdate()
-  ↓
-needsReconfigRebalance = true (ALWAYS for task changes)
-  ↓
-Rebalance triggered
-```
-
-**In Algorithm:**
-```java
-configuredTasks = configSnapshot.tasks(connector)  // Includes NEW task IDs
-  // e.g., connector-1: 111 tasks → 120 tasks (9 new task IDs)
-
-unassignedTasks = configuredTasks - memberAssignments.tasks()
-  // New tasks appear as unassigned
-```
-
-**Result:**
-- New tasks appear as "unassigned"
-- Existing tasks preserved in current assignments
-- Flow: Round 2 only (incremental assignment)
-- Convergence: 1 generation
-
-**Example:**
-```
-Before: c1 has 111 tasks, each worker has 11-12 c1 tasks
-Action: Increase c1 tasks.max from 110 to 120
-After: c1 has 120 tasks, need to distribute 9 new tasks
-Algorithm:
-  - Recalculate: c1min=12 (was 11)
-  - Round 2 Phase A: Fill workers to c1min=12
-  - Round 2 Phase B: Distribute any remaining tasks
-Result: Each worker has 12 c1 tasks, balanced
-```
-
-#### 4. Task Count Decreased (tasks.max ↓)
-
-**Flow:**
-```
-PUT /connectors/{name}/config with lower tasks.max
-  ↓
-Connector generates fewer task configs
-  ↓
-ConfigBackingStore.putTaskConfigs()
-  ↓
-ConfigUpdateListener.onTaskConfigUpdate()
-  ↓
-Rebalance triggered
-```
-
-**In Algorithm:**
-```java
-configuredTasks = configSnapshot.tasks(connector)  // Fewer task IDs
-  // e.g., connector-1: 111 tasks → 100 tasks (11 task IDs removed)
-
-// Tasks with removed IDs automatically filtered out
-currentTasks.removeIf(task -> !configuredTasks.contains(task.id()))
-```
-
-**Result:**
-- Removed tasks filtered out automatically
-- Remaining tasks preserved on current workers
-- Flow: Round 2 only if rebalancing needed
-- Convergence: 1 generation
-
-**Example:**
-```
-Before: c1 has 111 tasks, each worker has 11-12 c1 tasks
-Action: Decrease c1 tasks.max from 110 to 100
-After: c1 has 100 tasks, 11 tasks removed
-Algorithm:
-  - Recalculate: c1min=10, c1max=10
-  - Tasks c1-100 through c1-110 filtered out automatically
-  - Round 2: Rebalance if any worker now has >10 c1 tasks
-Result: Each worker has exactly 10 c1 tasks
-```
-
-#### 5. Connector Config Change Only (no task count change)
-
-**Flow:**
-```
-PUT /connectors/{name}/config with property changes
-  ↓
-ConfigUpdateListener.onConnectorConfigUpdate()
-  ↓
-If task configs unchanged:
-  └─> NO rebalance triggered (connectorConfigUpdates only)
-  └─> Connector restarted locally on its worker
-```
-
-**Result:**
-- Does NOT trigger rebalance
-- Connector restarted locally
-- Tasks continue running unchanged
-- Convergence: 0 generations (local operation)
-
-**Example:**
-```
-Before: connector-1 consuming from topics "topic-a,topic-b"
-Action: Update connector-1 config: topics="topic-a,topic-b,topic-c"
-Result: Connector-1 restarted on its worker, tasks unchanged
-```
-
-### Key Principles
-
-1. **ConfigSnapshot is Source of Truth**
-   ```
-   configSnapshot.connectors() → What SHOULD exist
-   configSnapshot.tasks(connector) → What SHOULD be running
-   memberAssignments → What IS currently running
-   ```
-
-2. **Automatic Filtering**
-   ```
-   Any task in memberAssignments but NOT in configSnapshot → Filtered out
-   Any task in configSnapshot but NOT in memberAssignments → Unassigned
-   ```
-
-3. **Unified Processing**
-   ```
-   Round 2 handles ALL unassigned tasks identically
-   Source doesn't matter (scale-down, new connector, task increase, etc.)
-   Same algorithm achieves consistent balance
-   ```
-
-4. **No Special Logic Needed**
-   ```
-   Algorithm doesn't distinguish between:
-   - "Task from new connector" vs "task from existing connector"
-   - "Task from scale-down" vs "task from task-count increase"
+═══════════════════════════════════════════════════════════════
+STEP 2 (ALWAYS EXECUTED): Check for Violations
+═══════════════════════════════════════════════════════════════
+   A. Detect Global Violations:
+      overloadedWorkers = workers with totalTasks > perWorkerTotalTasksMaxLimit
+      underloadedWorkers = workers with totalTasks < perWorkerTotalTasksMin
    
-   All unassigned tasks → Round 2 Phase A + Phase B → Balanced
-   ```
+   B. Detect Per-Consumer Violations:
+      consumerOverloads = (worker, consumer) pairs where
+                          worker.consumerTaskCount > perConsumerPerWorkerTaskCountMax
+      consumerUnderloads = (worker, consumer) pairs where
+                           worker.consumerTaskCount < perConsumerPerWorkerTaskCountMin
+   
+   C. Identify Unassigned Tasks:
+      unassignedTasks = tasks not yet assigned to any worker
+  ↓
+═══════════════════════════════════════════════════════════════
+DECISION POINT: Choose Action Based on Violations
+═══════════════════════════════════════════════════════════════
+   
+   IF overloadedWorkers NOT empty OR consumerOverloads NOT empty:
+     ↓
+     ┌────────────────────────────────────────────────────────┐
+     │ STEP 3: REVOCATION GENERATION (Overload violations)    │
+     └────────────────────────────────────────────────────────┘
+     
+     Action: Revoke excess tasks from violated workers/consumers
+     
+     Step 3a: Revoke from per-consumer overloads
+       - For each (worker, consumer) with violations
+       - Calculate excessCount = actual - max
+       - Revoke ALL excess tasks
+       - Update worker state after each revocation
+     
+     Step 3b: Revoke from globally overloaded workers
+       - For each worker with totalTasks > maxLimit
+       - Select consumer with most tasks on worker
+       - Revoke tasks until totalTasks ≤ maxLimit
+       - Update worker state after each revocation
+     
+     Return: ClusterAssignment with:
+       - newlyRevokedTasks: all revocations
+       - newlyAssignedTasks: EMPTY
+       - allAssignedTasks: current minus revocations
+     
+     Workers will:
+       - Stop revoked tasks
+       - Rejoin cluster
+       - Next generation re-runs Steps 1-2
+     ↓
+     SKIP Step 4 (no assignments in revocation generation)
+     ↓
+     
+   ELSE IF underloadedWorkers NOT empty OR consumerUnderloads NOT empty OR unassignedTasks NOT empty:
+     ↓
+     ┌────────────────────────────────────────────────────────┐
+     │ STEP 4: ASSIGNMENT GENERATION (No overload violations)  │
+     └────────────────────────────────────────────────────────┘
+     
+     Precondition Check:
+       ✅ overloadedWorkers IS empty
+       ✅ consumerOverloads IS empty
+       (Ensures we only assign, never revoke)
+     
+     Action: Fill deficits and assign unassigned tasks
+     
+     Phase A: Fill to minimum targets
+       - Fill per-consumer deficits first
+         * For each (worker, consumer) in consumerUnderloads
+         * Calculate deficitCount = min - actual
+         * Assign deficitCount tasks from unassigned pool
+         * Update worker state after each assignment
+       
+       - Fill globally underloaded workers
+         * For each worker in underloadedWorkers
+         * Assign tasks until totalTasks ≥ min
+         * Select consumer with fewest tasks on worker
+         * Update worker state after each assignment
+     
+     Phase B: Distribute remaining unassigned tasks
+       - While unassigned tasks remain
+       - Assign to worker with lowest totalTasks (≤ max)
+       - Select consumer with fewest tasks on worker
+       - Update worker state after each assignment
+     
+     Return: ClusterAssignment with:
+       - newlyAssignedTasks: all assignments
+       - newlyRevokedTasks: EMPTY
+       - allAssignedTasks: current plus assignments
+     
+     Workers will:
+       - Start newly assigned tasks
+       - Continue running existing tasks
+       - Next generation re-runs Steps 1-2
+     ↓
+     SKIP Step 3 (no revocations in assignment generation)
+     ↓
+     
+   ELSE:
+     ↓
+     ┌────────────────────────────────────────────────────────┐
+     │ NO ACTION: Cluster is Balanced                          │
+     └────────────────────────────────────────────────────────┘
+     
+     All violations satisfied:
+       ✅ overloadedWorkers IS empty
+       ✅ consumerOverloads IS empty
+       ✅ underloadedWorkers IS empty
+       ✅ consumerUnderloads IS empty
+       ✅ unassignedTasks IS empty
+     
+     Return: ClusterAssignment with:
+       - newlyAssignedTasks: EMPTY
+       - newlyRevokedTasks: EMPTY
+       - allAssignedTasks: unchanged
+     
+     Workers continue with current assignments
+     ↓
+     SKIP Steps 3 and 4 (no changes needed)
+  ↓
+═══════════════════════════════════════════════════════════════
+GENERATION COMPLETE
+═══════════════════════════════════════════════════════════════
+  Workers apply changes (EITHER revocations OR assignments OR nothing)
+  Workers rejoin cluster for next generation
+  Next generation repeats from Step 1
+
+═══════════════════════════════════════════════════════════════
+KEY PRINCIPLES
+═══════════════════════════════════════════════════════════════
+1. Steps 1-2 ALWAYS execute every generation
+2. Step 3 (Revocation) and Step 4 (Assignment) are MUTUALLY EXCLUSIVE
+3. Never revoke AND assign in the same generation
+4. Step 3 takes precedence: overload violations are fixed before assignments
+5. Workers rejoin after each generation, triggering next generation's Steps 1-2
+```
+
+### Configuration Recommendations
+
+Based on this incremental approach:
+
+```properties
+# Reduced rebalance timeout - generations are fast with minimal work
+CONNECT_REBALANCE_TIMEOUT_MS=120000  # 2 minutes
+
+# Faster session timeout - detect failures quickly
+CONNECT_SESSION_TIMEOUT_MS=30000  # 30 seconds
+
+# Shorter delayed rebalance - start rebalancing sooner
+CONNECT_SCHEDULED_REBALANCE_MAX_DELAY_MS=30000  # 30 seconds
+
+# Longer task shutdown - allow clean offset flushing
+CONNECT_TASK_SHUTDOWN_GRACEFUL_TIMEOUT_MS=100000  # 100 seconds
+```
+
+These settings from the deployment config are optimized for:
+- Fast failure detection (30s session timeout)
+- Quick rebalance initiation (30s delay)
+- Sufficient time for each incremental step (120s rebalance timeout)
+- Clean task shutdown (100s graceful timeout)
 
 ---
 
-COMPREHENSIVE SCENARIO SUMMARY:
+## Conclusion
 
-| Scenario | configSnapshot Changes | Round 1? | Round 2? | Generations | How It Works |
-|----------|----------------------|----------|----------|-------------|--------------|
-| **Worker Scale-Up** (10→12) | No change | ✅ YES (empty workers) | ✅ YES (all) | 2 | Empty workers trigger R1 full revocation → R2 redistributes all tasks |
-| **Worker Scale-Down** (10→8) | No change | ❌ NO | ✅ YES (lost only) | 1 | Delayed rebalance expires → R2 incrementally assigns lost tasks |
-| **New Connector** (c10 added) | +1 connector, +50 tasks | ✅ Maybe | ✅ YES | 1-2 | If empty workers: R1+R2. Else: R2 only assigns new 50 tasks |
-| **Connector Removed** (c9 deleted) | -1 connector, -1 task | ❌ NO | ✅ Maybe | 1 | Tasks filtered out automatically, R2 rebalances if needed |
-| **Tasks Increased** (c1: 111→120) | +9 c1 tasks | ❌ NO | ✅ YES | 1 | R2 Phase A fills higher consumerN_task_count_min, Phase B distributes 9 new tasks |
-| **Tasks Decreased** (c1: 111→100) | -11 c1 tasks | ❌ NO | ✅ Maybe | 1 | Tasks filtered out, R2 rebalances remaining if imbalanced |
-| **Config Change Only** | No task changes | ❌ NO | ❌ NO | 0 | Local connector restart, no rebalance triggered |
+The violation-based cooperative rebalancing approach transforms Kafka Connect's distributed task assignment into a precise, violation-driven process. By checking for specific violations first (overload vs. underload) and then taking targeted action, we achieve:
 
-KEY PATTERNS:
-1. Empty Workers → Always triggers Round 1 full revocation
-2. Task/Connector Changes → Round 2 handles incrementally (no full revocation)
-3. ConfigSnapshot filtering → Deleted connectors/tasks automatically removed
-4. Unassigned detection → Tasks in configSnapshot but not in memberAssignments
+- **Violation-Driven Decision Making**: Check THREE violation types (global, per-consumer, and distribution) before deciding action
+- **Targeted Revocations**: Revoke ONLY when overload violations detected (workers > maxLimit or consumers > max or distribution constraint violated)
+- **Targeted Assignments**: Assign ONLY when underload violations detected or unassigned tasks exist
+- **No Wasted Generations**: Take action only when violations exist, no action when balanced
+- **Clear Separation**: Revocation handles overload, Assignment handles underload - never mixed
+- **Cooperative Protocol Compliance**: Each generation performs ONLY revocations OR assignments, never both
+- **Efficient Deficit Filling**: Directly calculate and fill deficits instead of 1 task per iteration
+- **Fair Distribution**: Remaining tasks distributed evenly across least-loaded workers
+- **Mathematical Precision**: `maxNumberOfWorkersWithPerConsumerTaskCountMax` ensures exactly the right number of workers have maximum task count
+- **Better cloud-native fit**: Handles spot instance volatility gracefully with minimal per-generation disruption
+- **Lower operational risk**: Each generation moves exactly one task per consumer per worker
+- **Clearer reasoning**: Explicit balance checks and forecasting make behavior predictable
+- **Protocol alignment**: Natural fit with cooperative rebalancing philosophy
 
-This algorithm is designed for large-scale, multi-tenant, auto-scaled and/or spot-instance environments where:
-1. Fast convergence is critical (spot instances can terminate at any time)
-2. Per-consumer fairness is non-negotiable (multi-tenant SLAs)
-3. Aggressive rebalancing is acceptable (tasks can handle restarts)
-4. Worker churn is constant (scale-up/down happens frequently)
-5. Connector/task changes happen frequently (multi-tenant workloads)
+### Key Innovation: Forecasting + Per-Consumer Granularity + Distribution Constraint
+
+The combination of forecasting, per-consumer task movement, and distribution constraints is crucial:
+
+1. **Forecasting** tells us WHERE we need to be (target state)
+2. **Per-consumer granularity** ensures we get there FAIRLY (1 task per consumer per worker)
+3. **Re-sorting** maintains BALANCE throughout (after each action)
+4. **Balance checks** avoid UNNECESSARY work (only act when needed)
+5. **Distribution constraint** (`maxNumberOfWorkersWithPerConsumerTaskCountMax`) ensures MATHEMATICAL PRECISION (exactly the right number of workers have max count)
+
+### Example: Why Per-Consumer Matters
+
+**Without per-consumer approach:**
+```
+Generation 1: Revoke 1 task total from w0
+  Could revoke c1 task, leaving c2 still overloaded
+  Next generation must revoke c2 task
+  Result: 2 generations, serial balancing
+```
+
+**With per-consumer approach:**
+```
+Generation 1: Revoke 1 c1 task AND 1 c2 task from w0
+  Addresses both consumers simultaneously
+  Result: 1 generation, parallel balancing
+```
+
+This approach is particularly valuable in large-scale, multi-tenant environments where:
+- Hundreds of connectors with vastly different task counts run simultaneously
+- Workers frequently join/leave due to autoscaling or spot terminations
+- Continuous operation is critical (downtime is costly)
+- Balance must be maintained across BOTH global AND per-connector dimensions simultaneously
+- Forecasting ensures optimal convergence path
+- Per-consumer granularity ensures fairness is never sacrificed
+
+The intelligent forecasting approach ensures that Kafka Connect clusters remain healthy, balanced, and resilient even in the face of constant change, while optimizing the path to perfect balance.
 

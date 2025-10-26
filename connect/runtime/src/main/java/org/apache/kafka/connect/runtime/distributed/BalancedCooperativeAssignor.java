@@ -117,7 +117,7 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         log.info("=== Starting BalancedCooperativeAssignor for generation {} (previous: {}) ===", 
                 currentGenerationId, lastCompletedGenerationId);
         
-        // Step 1: Build current state from ConfigSnapshot
+        // Build current state from ConfigSnapshot
         Set<String> configuredConnectors = new TreeSet<>(configSnapshot.connectors());
         Set<ConnectorTaskId> configuredTasks = new TreeSet<>();
         for (String connector : configuredConnectors) {
@@ -135,7 +135,9 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
             return ClusterAssignment.EMPTY;
         }
         
-        // Calculate balance targets
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 1 (ALWAYS): Calculate Balance Targets
+        // ═══════════════════════════════════════════════════════════════
         BalanceTargets targets = calculateBalanceTargets(workers, configuredConnectors, configuredTasks);
         
         // Identify unassigned tasks
@@ -147,58 +149,55 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         
         log.info("Current state - Assigned: {}, Unassigned: {}", allAssignedTasks.size(), unassignedTasks.size());
         
-        // Step 2: Check Round 1 Triggers and decide action
-        boolean triggerRound1 = shouldTriggerRound1(workers, targets);
-        boolean hasTasksToRevoke = allAssignedTasks.size() > 0;
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 2 (ALWAYS): Check for Balance Violations
+        // ═══════════════════════════════════════════════════════════════
+        ViolationState violations = detectViolations(workers, targets, unassignedTasks);
         
         Map<String, Collection<ConnectorTaskId>> tasksToRevoke = new HashMap<>();
         Map<String, Collection<ConnectorTaskId>> tasksToAssign = new HashMap<>();
         
-        // Cooperative Protocol Rule: A single rebalance can EITHER revoke OR assign, not both
+        // Cooperative Protocol Rule: A single generation can EITHER revoke OR assign, not both
         
-        if (triggerRound1 && hasTasksToRevoke) {
-            // Round 1: Full Revocation (only if there are tasks to revoke)
-            log.info("=== ROUND 1: Full Revocation Triggered ===");
-            tasksToRevoke = performRound1FullRevocation(workers);
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 3 (CONDITIONAL): REVOCATION GENERATION
+        // Only if overload violations detected
+        // ═══════════════════════════════════════════════════════════════
+        if (violations.hasOverloadViolations()) {
+            log.info("=== STEP 3: REVOCATION GENERATION (overload violations detected) ===");
+            tasksToRevoke = performRevocationGeneration(workers, violations, targets);
             
-            // Update worker state after revocation
-            for (WorkerState worker : workers) {
-                Collection<ConnectorTaskId> revoked = tasksToRevoke.getOrDefault(worker.worker, Collections.emptyList());
-                worker.assignedTasks.removeAll(revoked);
-                unassignedTasks.addAll(revoked);
-            }
-            
-            log.info("Round 1 complete - Revoked: {} tasks from {} workers", 
+            log.info("Revocation complete - Revoked: {} tasks from {} workers", 
                     tasksToRevoke.values().stream().mapToInt(Collection::size).sum(),
                     tasksToRevoke.size());
             
             // Cooperative protocol: After revocations, we cannot assign in the same generation
-            // Workers will rejoin and next rebalance will perform Round 2 assignments
+            // Workers will rejoin and next generation will re-run Steps 1-2
             
-        } else if (!unassignedTasks.isEmpty()) {
-            // Round 2: Complete Assignment
-            // This happens when:
-            // 1. Round 1 would trigger but there's nothing to revoke (empty workers scenario)
-            // 2. Round 1 not triggered and there are unassigned tasks
-            log.info("=== ROUND 2: Complete Assignment (skipping Round 1) ===");
-            tasksToAssign = performRound2CompleteAssignment(workers, unassignedTasks, targets);
+        // ═══════════════════════════════════════════════════════════════
+        // STEP 4 (CONDITIONAL): ASSIGNMENT GENERATION
+        // Only if no overload violations AND (underload violations OR unassigned tasks)
+        // ═══════════════════════════════════════════════════════════════
+        } else if (violations.hasUnderloadViolations() || !unassignedTasks.isEmpty()) {
+            log.info("=== STEP 4: ASSIGNMENT GENERATION (no overload, but underload or unassigned) ===");
+            tasksToAssign = performAssignmentGeneration(workers, violations, targets, unassignedTasks);
             
-            log.info("Round 2 complete - Assigned: {} tasks to {} workers",
+            log.info("Assignment complete - Assigned: {} tasks to {} workers",
                     tasksToAssign.values().stream().mapToInt(Collection::size).sum(),
                     tasksToAssign.size());
         } else {
             log.info("Cluster is balanced, no actions needed");
         }
         
-        // Step 3: Build final task assignments
+        // Build final task assignments
         Map<String, Collection<ConnectorTaskId>> allTaskAssignments = buildFinalTaskAssignments(
                 workers, memberAssignments, tasksToRevoke, tasksToAssign, configuredConnectors);
         
-        // Step 4: Handle connector assignments
+        // Handle connector assignments
         ConnectorAssignments connectorAssignments = buildConnectorAssignments(
                 workers, memberAssignments, allTaskAssignments, configuredConnectors);
         
-        // Step 5: Handle deleted connectors and tasks
+        // Handle deleted connectors and tasks
         DeletionInfo deletionInfo = identifyDeletions(memberAssignments, configuredConnectors, configuredTasks);
         
         // Merge deleted connector tasks with other task revocations
@@ -224,69 +223,278 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         );
     }
     
-    // ==================== Round 1: Full Revocation ====================
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 2: Detect Balance Violations
+    // ═══════════════════════════════════════════════════════════════
+    
     /**
-     * Check if Round 1 (full revocation) should be triggered.
-     * 
-     * Round 1 is triggered if ANY of these conditions are met:
-     * 1. Scale-Up Detection: Any worker has 0 assigned tasks
-     * 2. Severe Imbalance: Any worker has > globalMaxLimit tasks
+     * Detect all types of balance violations.
+     * Returns a ViolationState containing all detected violations.
      */
-    private boolean shouldTriggerRound1(List<WorkerState> workers, BalanceTargets targets) {
+    private ViolationState detectViolations(
+            List<WorkerState> workers,
+            BalanceTargets targets,
+            Set<ConnectorTaskId> unassignedTasks) {
+        
+        ViolationState violations = new ViolationState();
+        
+        log.debug("Detecting violations - targets: globalMin={}, globalMax={}, globalMaxLimit={}",
+                targets.minTasksPerWorker, targets.maxTasksPerWorker, targets.maxTasksPerWorkerMaxLimit);
+        
+        // A. Global Balance Violation Check
         for (WorkerState worker : workers) {
-            int taskCount = worker.assignedTasks.size();
+            int totalTasks = worker.assignedTasks.size();
             
-            // Trigger 1: Empty worker detected (scale-up scenario)
-            if (taskCount == 0) {
-                log.info("Round 1 Trigger: Empty worker detected ({})", worker.worker);
-                return true;
-            }
-            
-            // Trigger 2: Worker exceeds globalMaxLimit (severe imbalance)
-            if (taskCount > targets.globalMaxLimit) {
-                log.info("Round 1 Trigger: Severe imbalance detected - worker {} has {} tasks (limit: {})",
-                        worker.worker, taskCount, targets.globalMaxLimit);
-                return true;
+            if (totalTasks > targets.maxTasksPerWorkerMaxLimit) {
+                violations.overloadedWorkers.add(worker);
+                log.debug("Global OVERLOAD: worker {} has {} tasks > globalMaxLimit {}", 
+                        worker.worker, totalTasks, targets.maxTasksPerWorkerMaxLimit);
+            } else if (totalTasks < targets.minTasksPerWorker) {
+                violations.underloadedWorkers.add(worker);
+                log.debug("Global UNDERLOAD: worker {} has {} tasks < globalMin {}", 
+                        worker.worker, totalTasks, targets.minTasksPerWorker);
             }
         }
         
-        log.info("Round 1 NOT triggered - proceeding to Round 2 for incremental assignment");
-        return false;
+        // B. Per-Consumer Balance Violation Check
+        for (WorkerState worker : workers) {
+            for (Map.Entry<String, ConsumerTarget> entry : targets.perConsumerTargets.entrySet()) {
+                String consumer = entry.getKey();
+                ConsumerTarget target = entry.getValue();
+                int currentCount = worker.getTaskCountForConnector(consumer);
+                
+                if (currentCount > target.consumerNTaskCountMax) {
+                    // Worker exceeds max for this consumer
+                    violations.consumerOverloads.add(new ConsumerViolation(worker, consumer, currentCount, target));
+                    log.debug("Per-consumer OVERLOAD: worker {} has {} tasks from {} > max {}", 
+                            worker.worker, currentCount, consumer, target.consumerNTaskCountMax);
+                } else if (currentCount == target.consumerNTaskCountMax && target.consumerNTaskCountMin < target.consumerNTaskCountMax) {
+                    // Only check max count violations when min < max (imperfect division)
+                    // When min == max (perfect division), all workers should have exactly that count
+                    long workersWithMaxCount = workers.stream()
+                            .filter(w -> w.getTaskCountForConnector(consumer) == target.consumerNTaskCountMax)
+                            .count();
+                    
+                    if (workersWithMaxCount > target.maxWorkersWithTaskCountMax) {
+                        // Too many workers have max - this worker needs to revoke to reach min
+                        violations.consumerOverloads.add(new ConsumerViolation(worker, consumer, currentCount, target));
+                        log.debug("Per-consumer MAX COUNT violation: {} workers have {} tasks from {} (max allowed: {})", 
+                                workersWithMaxCount, target.consumerNTaskCountMax, consumer, target.maxWorkersWithTaskCountMax);
+                    }
+                } else if (currentCount < target.consumerNTaskCountMin) {
+                    // Worker is below min for this consumer
+                    violations.consumerUnderloads.add(new ConsumerViolation(worker, consumer, currentCount, target));
+                    log.debug("Per-consumer UNDERLOAD: worker {} has {} tasks from {} < min {}", 
+                            worker.worker, currentCount, consumer, target.consumerNTaskCountMin);
+                }
+            }
+        }
+        
+        violations.unassignedTasks.addAll(unassignedTasks);
+        
+        log.info("Violation detection complete - Overloaded workers: {}, Consumer overloads: {}, " +
+                "Underloaded workers: {}, Consumer underloads: {}, Unassigned: {}",
+                violations.overloadedWorkers.size(), violations.consumerOverloads.size(),
+                violations.underloadedWorkers.size(), violations.consumerUnderloads.size(),
+                violations.unassignedTasks.size());
+        
+        // Debug: Log first few consumer violations for troubleshooting
+        if (!violations.consumerOverloads.isEmpty()) {
+            log.info("Sample consumer overloads: {}", violations.consumerOverloads.stream()
+                    .limit(5)
+                    .map(v -> String.format("%s/%s:has=%d,max=%d", v.worker.worker, v.consumer, v.actualCount, v.target.consumerNTaskCountMax))
+                    .collect(Collectors.joining(", ")));
+        }
+        if (!violations.consumerUnderloads.isEmpty()) {
+            log.info("Sample consumer underloads: {}", violations.consumerUnderloads.stream()
+                    .limit(5)
+                    .map(v -> String.format("%s/%s:has=%d,min=%d", v.worker.worker, v.consumer, v.actualCount, v.target.consumerNTaskCountMin))
+                    .collect(Collectors.joining(", ")));
+        }
+        
+        return violations;
     }
     
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 3: Revocation Generation
+    // ═══════════════════════════════════════════════════════════════
+    
     /**
-     * Perform Round 1: Full revocation of all tasks from all workers.
-     * 
-     * This prepares for optimal redistribution in Round 2.
+     * Perform incremental revocation from overloaded workers.
+     * Revokes ALL excess tasks that violate limits in this generation.
+     * Also performs "rebalancing revocations" when workers are below min but no unassigned tasks exist.
      */
-    private Map<String, Collection<ConnectorTaskId>> performRound1FullRevocation(List<WorkerState> workers) {
+    private Map<String, Collection<ConnectorTaskId>> performRevocationGeneration(
+            List<WorkerState> workers,
+            ViolationState violations,
+            BalanceTargets targets) {
+        
         Map<String, Collection<ConnectorTaskId>> revocations = new HashMap<>();
         
-        for (WorkerState worker : workers) {
-            if (!worker.assignedTasks.isEmpty()) {
-                List<ConnectorTaskId> allTasks = new ArrayList<>(worker.assignedTasks);
-                Collections.sort(allTasks);
-                revocations.put(worker.worker, allTasks);
+        // 1. Revoke from per-consumer overloads FIRST
+        // Sort by violation severity (most overloaded first)
+        violations.consumerOverloads.sort((v1, v2) -> {
+            int excess1 = v1.actualCount - v1.target.consumerNTaskCountMin;
+            int excess2 = v2.actualCount - v2.target.consumerNTaskCountMin;
+            return Integer.compare(excess2, excess1);
+        });
+        
+        for (ConsumerViolation violation : violations.consumerOverloads) {
+            WorkerState worker = violation.worker;
+            String consumer = violation.consumer;
+            
+            // According to spec: Revoke down to consumerNTaskCountMin
+            // excessCount = worker.consumerTaskCount[consumer] - perConsumerPerWorkerTaskCountMin[consumer]
+            int currentCount = worker.getTaskCountForConnector(consumer);
+            int excessCount = currentCount - violation.target.consumerNTaskCountMin;
+            
+            if (excessCount <= 0) {
+                log.trace("Skipping consumer {} on worker {} - no excess after previous revocations (current: {}, min: {})",
+                        consumer, worker.worker, currentCount, violation.target.consumerNTaskCountMin);
+                continue;
+            }
+            
+            log.debug("Revoking {} tasks of consumer {} from worker {} (current: {}, min: {})",
+                    excessCount, consumer, worker.worker, currentCount, violation.target.consumerNTaskCountMin);
+            
+            // Revoke ALL excess tasks from this consumer on this worker
+            List<ConnectorTaskId> tasksFromConsumer = worker.assignedTasks.stream()
+                    .filter(task -> task.connector().equals(consumer))
+                    .sorted()
+                    .limit(excessCount)
+                    .collect(Collectors.toList());
+            
+            for (ConnectorTaskId task : tasksFromConsumer) {
+                revocations.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(task);
+                worker.assignedTasks.remove(task);
                 
-                log.debug("Round 1 - Revoking {} tasks from worker {}", allTasks.size(), worker.worker);
+                log.trace("Revoked task {} from worker {} (per-consumer: {} now has {} tasks, min: {})",
+                        task, worker.worker, consumer, worker.getTaskCountForConnector(consumer), 
+                        violation.target.consumerNTaskCountMin);
+            }
+        }
+        
+        // 2. Revoke from globally overloaded workers
+        // According to spec: Revoke while worker.totalTasks > perWorkerTotalTasksMin
+        // IMPORTANT: Check current state (post per-consumer revocations), not original violations list
+        for (WorkerState worker : workers) {
+            // Only process workers that are STILL overloaded after per-consumer revocations
+            if (worker.assignedTasks.size() <= targets.minTasksPerWorker) {
+                continue;
+            }
+            
+            log.debug("Worker {} globally overloaded after per-consumer revocations (has {} tasks, min: {})",
+                    worker.worker, worker.assignedTasks.size(), targets.minTasksPerWorker);
+            
+            while (worker.assignedTasks.size() > targets.minTasksPerWorker) {
+                // Select consumer with most tasks on this worker
+                String consumerWithMost = findConsumerWithMostTasksOnWorker(worker);
+                
+                if (consumerWithMost == null) {
+                    log.warn("Cannot find consumer to revoke from worker {} - breaking", worker.worker);
+                    break;
+                }
+                
+                // Revoke 1 task from that consumer
+                ConnectorTaskId taskToRevoke = worker.assignedTasks.stream()
+                        .filter(task -> task.connector().equals(consumerWithMost))
+                        .sorted()
+                        .findFirst()
+                        .orElse(null);
+                
+                if (taskToRevoke == null) {
+                    log.warn("Cannot find task to revoke from consumer {} on worker {}", 
+                            consumerWithMost, worker.worker);
+                    break;
+                }
+                
+                revocations.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(taskToRevoke);
+                worker.assignedTasks.remove(taskToRevoke);
+                
+                log.trace("Revoked task {} from worker {} (global overload, now has {} tasks)",
+                        taskToRevoke, worker.worker, worker.assignedTasks.size());
+            }
+        }
+        
+        // 3. Rebalancing revocations: If workers have per-consumer underloads but are at globalMax,
+        // they need to drop tasks from over-represented connectors to make room
+        for (ConsumerViolation underload : violations.consumerUnderloads) {
+            WorkerState worker = underload.worker;
+            
+            // Only if worker is at or above globalMax (can't accept more tasks without dropping some)
+            if (worker.assignedTasks.size() < targets.maxTasksPerWorker) {
+                continue; // Worker has room, no need for rebalancing revocations
+            }
+            
+            String underloadedConsumer = underload.consumer;
+            int deficit = underload.target.consumerNTaskCountMin - underload.actualCount;
+            
+            if (deficit <= 0) {
+                continue; // Already satisfied
+            }
+            
+            log.debug("Rebalancing revocation: worker {} is underloaded for {} (has {}, needs {}+) but at globalMax",
+                    worker.worker, underloadedConsumer, underload.actualCount, underload.target.consumerNTaskCountMin);
+            
+            // Find connectors where this worker has MORE than min (candidates for revocation)
+            List<String> overRepresentedConnectors = targets.perConsumerTargets.entrySet().stream()
+                    .filter(e -> {
+                        String connector = e.getKey();
+                        if (connector.equals(underloadedConsumer)) {
+                            return false; // Don't revoke from the underloaded connector
+                        }
+                        int currentCount = worker.getTaskCountForConnector(connector);
+                        int min = e.getValue().consumerNTaskCountMin;
+                        return currentCount > min; // Has more than min
+                    })
+                    .sorted((e1, e2) -> {
+                        // Sort by excess (most excess first)
+                        int excess1 = worker.getTaskCountForConnector(e1.getKey()) - e1.getValue().consumerNTaskCountMin;
+                        int excess2 = worker.getTaskCountForConnector(e2.getKey()) - e2.getValue().consumerNTaskCountMin;
+                        return Integer.compare(excess2, excess1);
+                    })
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toList());
+            
+            // Revoke tasks from over-represented connectors to make room
+            int tasksToRevoke = Math.min(deficit, overRepresentedConnectors.size());
+            for (int i = 0; i < tasksToRevoke && i < overRepresentedConnectors.size(); i++) {
+                String connectorToRevoke = overRepresentedConnectors.get(i);
+                
+                ConnectorTaskId taskToRevoke = worker.assignedTasks.stream()
+                        .filter(task -> task.connector().equals(connectorToRevoke))
+                        .sorted()
+                        .findFirst()
+                        .orElse(null);
+                
+                if (taskToRevoke != null) {
+                    revocations.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(taskToRevoke);
+                    worker.assignedTasks.remove(taskToRevoke);
+                    
+                    log.debug("Rebalancing revocation: revoked task {} from worker {} to make room for {}",
+                            taskToRevoke, worker.worker, underloadedConsumer);
+                }
             }
         }
         
         return revocations;
     }
     
-    // ==================== Round 2: Complete Assignment ====================
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 4: Assignment Generation
+    // ═══════════════════════════════════════════════════════════════
+    
     /**
-     * Perform Round 2: Complete assignment of all unassigned tasks.
-     * 
+     * Perform incremental assignment to underloaded workers and unassigned tasks.
      * Consists of two phases:
-     * - Phase A: Fill to consumerNTaskCountMin (minimum guarantee)
-     * - Phase B: Distribute remaining tasks
+     * - Phase A: Fill workers to minimum targets
+     * - Phase B: Distribute remaining unassigned tasks
      */
-    private Map<String, Collection<ConnectorTaskId>> performRound2CompleteAssignment(
+    private Map<String, Collection<ConnectorTaskId>> performAssignmentGeneration(
             List<WorkerState> workers,
-            Set<ConnectorTaskId> unassignedTasks,
-            BalanceTargets targets) {
+            ViolationState violations,
+            BalanceTargets targets,
+            Set<ConnectorTaskId> unassignedTasks) {
         
         Map<String, Collection<ConnectorTaskId>> assignments = new HashMap<>();
         
@@ -299,177 +507,195 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         // Sort tasks for determinism
         unassignedByConsumer.values().forEach(Collections::sort);
         
-        log.info("Round 2 - Starting with {} unassigned tasks across {} consumers",
+        log.debug("Assignment generation - {} unassigned tasks across {} consumers",
                 unassignedTasks.size(), unassignedByConsumer.size());
         
-        // Phase A: Fill to consumerNTaskCountMin
-        performPhaseA_FillToConsumerNTaskCountMin(workers, unassignedByConsumer, targets, assignments);
+        // PHASE A: Fill workers to minimum targets
+        performPhaseA_FillToMinimum(workers, violations, targets, unassignedByConsumer, assignments);
         
-        // Phase B: Distribute remaining tasks
-        performPhaseB_DistributeRemaining(workers, unassignedByConsumer, targets, assignments);
+        // PHASE B: Distribute remaining unassigned tasks
+        performPhaseB_DistributeRemaining(workers, targets, unassignedByConsumer, assignments);
         
         return assignments;
     }
     
     /**
-     * Phase A: Fill to consumerNTaskCountMin (Minimum Guarantee)
-     * 
-     * Ensure every worker gets at least consumerNTaskCountMin tasks from each consumer before distributing extras.
-     * Strategy: 1-task-at-a-time assignment with re-sorting to maintain perfect balance throughout.
+     * Phase A: Fill all workers to consumerNTaskCountMin for each consumer.
+     * This ensures every worker has the minimum task count for every consumer.
+     * Global balance limits are IGNORED in this phase - per-consumer balance is priority.
      */
-    private void performPhaseA_FillToConsumerNTaskCountMin(
+    private void performPhaseA_FillToMinimum(
             List<WorkerState> workers,
-            Map<String, List<ConnectorTaskId>> unassignedByConsumer,
+            ViolationState violations,
             BalanceTargets targets,
+            Map<String, List<ConnectorTaskId>> unassignedByConsumer,
             Map<String, Collection<ConnectorTaskId>> assignments) {
         
-        log.info("Phase A: Fill to consumerNTaskCountMin");
+        log.debug("Phase A: Fill all workers to consumerNTaskCountMin for each consumer (ignoring global limits)");
         
-        // Sort consumers by consumerNTaskCountMax (descending) - prioritize high consumerNTaskCountMax first
-        List<String> sortedConsumers = unassignedByConsumer.keySet().stream()
-                .sorted((c1, c2) -> Integer.compare(
-                        targets.perConsumerTargets.get(c2).consumerNTaskCountMax,
-                        targets.perConsumerTargets.get(c1).consumerNTaskCountMax))
+        // Sort consumers by total task count (descending) to process largest first
+        List<String> sortedConsumers = targets.perConsumerTargets.entrySet().stream()
+                .sorted((e1, e2) -> Integer.compare(e2.getValue().totalTasks, e1.getValue().totalTasks))
+                .map(Map.Entry::getKey)
                 .collect(Collectors.toList());
         
+        // For each consumer, fill ALL workers to consumerNTaskCountMin
         for (String consumer : sortedConsumers) {
             ConsumerTarget target = targets.perConsumerTargets.get(consumer);
-            List<ConnectorTaskId> unassigned = unassignedByConsumer.get(consumer);
+            List<ConnectorTaskId> available = unassignedByConsumer.get(consumer);
             
-            if (unassigned.isEmpty() || target.consumerNTaskCountMin == 0) {
+            if (available == null || available.isEmpty()) {
+                log.trace("Phase A - No unassigned tasks for consumer {}", consumer);
                 continue;
             }
             
-            log.debug("Phase A - Consumer: {}, consumerNTaskCountMin: {}, unassigned: {}", 
-                    consumer, target.consumerNTaskCountMin, unassigned.size());
+            log.debug("Phase A - Processing consumer {} with {} unassigned tasks, target min={} per worker",
+                    consumer, available.size(), target.consumerNTaskCountMin);
             
-            // Fill each worker to consumerNTaskCountMin, re-sorting after each task assignment
-            boolean progress = true;
-            while (progress && !unassigned.isEmpty()) {
-                progress = false;
+            // Fill each worker to consumerNTaskCountMin for this consumer
+            for (WorkerState worker : workers) {
+                int currentCount = worker.getTaskCountForConnector(consumer);
+                int deficit = target.consumerNTaskCountMin - currentCount;
                 
-                // Sort workers by total load (ascending - least loaded first)
-                workers.sort(Comparator.comparingInt(w -> w.assignedTasks.size()));
+                if (deficit <= 0) {
+                    log.trace("Phase A - Worker {} already has min for consumer {} (has {}, min={})",
+                            worker.worker, consumer, currentCount, target.consumerNTaskCountMin);
+                    continue; // Worker already has minimum for this consumer
+                }
                 
-                for (WorkerState worker : workers) {
-                    int currentCount = worker.getTaskCountForConnector(consumer);
+                int tasksToAssign = Math.min(deficit, available.size());
+                
+                log.debug("Phase A - Assigning {} tasks to worker {} for consumer {} (current={}, min={}, total={})",
+                        tasksToAssign, worker.worker, consumer, currentCount, target.consumerNTaskCountMin,
+                        worker.assignedTasks.size());
+                
+                for (int i = 0; i < tasksToAssign; i++) {
+                    ConnectorTaskId task = available.remove(0);
+                    assignments.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(task);
+                    worker.assignedTasks.add(task);
                     
-                    if (currentCount < target.consumerNTaskCountMin && !unassigned.isEmpty()) {
-                        // Assign EXACTLY 1 task
-                        ConnectorTaskId task = unassigned.remove(0);
-                        
-                        assignments.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(task);
-                        worker.assignedTasks.add(task);
-                        
-                        progress = true;
-                        
-                        log.trace("Phase A - Assigned task {} to worker {} (now has {} from {})",
-                                task, worker.worker, currentCount + 1, consumer);
-                        
-                        // Break and re-sort after each task assignment (critical for balance)
-                        break;
-                    }
+                    log.trace("Phase A - Assigned task {} to worker {} (consumer {} deficit, now has {})",
+                            task, worker.worker, consumer, worker.getTaskCountForConnector(consumer));
+                }
+                
+                if (available.isEmpty()) {
+                    break; // No more tasks for this consumer
                 }
             }
         }
         
         int remaining = unassignedByConsumer.values().stream().mapToInt(List::size).sum();
-        log.info("Phase A complete - Remaining unassigned: {}", remaining);
+        log.debug("Phase A complete - Remaining unassigned: {}", remaining);
     }
     
     /**
-     * Phase B: Distribute Remaining Tasks
-     * 
-     * Distribute all remaining unassigned tasks while respecting consumerNTaskCountMax and globalMaxLimit.
-     * Strategy: 1-task-at-a-time assignment to least-loaded eligible workers.
+     * Phase B: Round-robin distribution of remaining tasks.
+     * Strategy: Process consumers sorted by task count (largest first).
+     * For each consumer, assign 1 task at a time to workers in round-robin fashion.
+     * Global limits are IGNORED - only per-consumer balance (consumerNTaskCountMax) is enforced.
      */
     private void performPhaseB_DistributeRemaining(
             List<WorkerState> workers,
-            Map<String, List<ConnectorTaskId>> unassignedByConsumer,
             BalanceTargets targets,
+            Map<String, List<ConnectorTaskId>> unassignedByConsumer,
             Map<String, Collection<ConnectorTaskId>> assignments) {
         
-        log.info("Phase B: Distribute remaining tasks");
+        log.debug("Phase B: Round-robin distribution of remaining tasks (ignoring global limits)");
         
-        // Sort consumers by remaining task count (descending) - prioritize consumers with most remaining tasks
-        while (unassignedByConsumer.values().stream().anyMatch(l -> !l.isEmpty())) {
-            List<String> sortedConsumers = unassignedByConsumer.entrySet().stream()
-                    .filter(e -> !e.getValue().isEmpty())
-                    .sorted((e1, e2) -> Integer.compare(e2.getValue().size(), e1.getValue().size()))
-                    .map(Map.Entry::getKey)
-                    .collect(Collectors.toList());
+        // Sort consumers by total task count (descending) - process largest first
+        List<String> sortedConsumers = targets.perConsumerTargets.entrySet().stream()
+                .filter(e -> {
+                    List<ConnectorTaskId> tasks = unassignedByConsumer.get(e.getKey());
+                    return tasks != null && !tasks.isEmpty();
+                })
+                .sorted((e1, e2) -> Integer.compare(e2.getValue().totalTasks, e1.getValue().totalTasks))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+        
+        log.debug("Phase B - Processing {} consumers with unassigned tasks", sortedConsumers.size());
+        
+        // Track which worker to start with for each consumer (for round-robin continuity)
+        int workerStartIndex = 0;
+        
+        // Process each consumer in order
+        for (String consumer : sortedConsumers) {
+            List<ConnectorTaskId> unassigned = unassignedByConsumer.get(consumer);
+            ConsumerTarget target = targets.perConsumerTargets.get(consumer);
             
-            if (sortedConsumers.isEmpty()) {
-                break;
+            if (unassigned.isEmpty()) {
+                continue;
             }
             
-            boolean progress = false;
+            log.debug("Phase B - Processing consumer {} with {} unassigned tasks, max={} per worker",
+                    consumer, unassigned.size(), target.consumerNTaskCountMax);
             
-            for (String consumer : sortedConsumers) {
-                List<ConnectorTaskId> unassigned = unassignedByConsumer.get(consumer);
-                ConsumerTarget target = targets.perConsumerTargets.get(consumer);
-                boolean isSmallConsumer = target.totalTasks <= workers.size();
+            // Round-robin assignment: 1 task at a time to each worker
+            int currentWorkerIndex = workerStartIndex;
+            
+            while (!unassigned.isEmpty()) {
+                boolean taskAssigned = false;
+                int attemptsCount = 0;
                 
-                if (unassigned.isEmpty()) {
-                    continue;
-                }
-                
-                // Sort workers by total load (ascending - least loaded first)
-                workers.sort(Comparator.comparingInt(w -> w.assignedTasks.size()));
-                
-                // Find first eligible worker
-                WorkerState selectedWorker = null;
-                for (WorkerState worker : workers) {
+                // Try to find a worker starting from currentWorkerIndex
+                while (attemptsCount < workers.size()) {
+                    WorkerState worker = workers.get(currentWorkerIndex);
                     int currentCount = worker.getTaskCountForConnector(consumer);
                     
-                    // Check eligibility criteria
-                    boolean withinGlobalLimit = worker.assignedTasks.size() < targets.globalMaxLimit;
-                    boolean withinConsumerMax = currentCount < target.consumerNTaskCountMax;
-                    boolean withinSmallConsumerLimit = !isSmallConsumer || currentCount < 1;
-                    
-                    if (withinGlobalLimit && withinConsumerMax && withinSmallConsumerLimit) {
-                        selectedWorker = worker;
+                    // Check if this worker can accept another task for this consumer
+                    // Only constraint: must not exceed consumerNTaskCountMax
+                    if (currentCount < target.consumerNTaskCountMax) {
+                        // Assign 1 task to this worker
+                        ConnectorTaskId task = unassigned.remove(0);
+                        assignments.computeIfAbsent(worker.worker, k -> new ArrayList<>()).add(task);
+                        worker.assignedTasks.add(task);
+                        
+                        log.trace("Phase B - Assigned task {} to worker {} (consumer {}, now has {}/{}, total: {})",
+                                task, worker.worker, consumer, 
+                                worker.getTaskCountForConnector(consumer), target.consumerNTaskCountMax,
+                                worker.assignedTasks.size());
+                        
+                        taskAssigned = true;
+                        
+                        // Move to next worker for round-robin
+                        currentWorkerIndex = (currentWorkerIndex + 1) % workers.size();
                         break;
                     }
+                    
+                    // This worker is at max for this consumer, try next worker
+                    currentWorkerIndex = (currentWorkerIndex + 1) % workers.size();
+                    attemptsCount++;
                 }
                 
-                if (selectedWorker == null) {
-                    if (isSmallConsumer) {
-                        log.debug("Phase B - Cannot assign remaining {} tasks for small consumer {} - all workers either at globalMaxLimit or already have 1 task",
-                                unassigned.size(), consumer);
-                    } else {
-                        log.warn("Phase B - Cannot assign remaining {} tasks for consumer {} - all workers at capacity",
-                                unassigned.size(), consumer);
-                    }
-                    // Remove from unassigned to avoid infinite loop
-                    unassigned.clear();
-                    continue;
+                if (!taskAssigned) {
+                    // All workers are at consumerNTaskCountMax for this consumer
+                    // This should theoretically not happen if our math is correct, but handle gracefully
+                    log.error("Phase B - Cannot assign remaining {} tasks for consumer {} - all workers at max={}",
+                            unassigned.size(), consumer, target.consumerNTaskCountMax);
+                    break;
                 }
-                
-                // Assign EXACTLY 1 task
-                ConnectorTaskId task = unassigned.remove(0);
-                assignments.computeIfAbsent(selectedWorker.worker, k -> new ArrayList<>()).add(task);
-                selectedWorker.assignedTasks.add(task);
-                
-                progress = true;
-                
-                log.trace("Phase B - Assigned task {} to worker {} (total: {}, from {}: {})",
-                        task, selectedWorker.worker, selectedWorker.assignedTasks.size(),
-                        consumer, selectedWorker.getTaskCountForConnector(consumer));
             }
             
-            if (!progress) {
-                // No progress made, exit to avoid infinite loop
-                int remaining = unassignedByConsumer.values().stream().mapToInt(List::size).sum();
-                if (remaining > 0) {
-                    log.warn("Phase B - Stopping with {} unassigned tasks (no eligible workers found)", remaining);
-                }
-                break;
-            }
+            // Update start index for next consumer (maintain round-robin across consumers)
+            workerStartIndex = currentWorkerIndex;
+            
+            log.debug("Phase B - Completed consumer {}, {} tasks remaining across all consumers",
+                    consumer, unassignedByConsumer.values().stream().mapToInt(List::size).sum());
         }
         
         int remaining = unassignedByConsumer.values().stream().mapToInt(List::size).sum();
-        log.info("Phase B complete - Remaining unassigned: {}", remaining);
+        log.debug("Phase B complete - Remaining unassigned: {}", remaining);
+    }
+    
+    // Helper methods for revocation and assignment
+    
+    private String findConsumerWithMostTasksOnWorker(WorkerState worker) {
+        Map<String, Long> taskCounts = worker.assignedTasks.stream()
+                .collect(Collectors.groupingBy(ConnectorTaskId::connector, Collectors.counting()));
+        
+        return taskCounts.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(null);
     }
     
     // ==================== Helper Methods ====================
@@ -486,9 +712,10 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
             WorkerState worker = new WorkerState(entry.getKey());
             
-            // Filter out tasks belonging to deleted connectors
+            // Filter out tasks that no longer exist in the configuration
+            // This handles both deleted connectors AND decreased task counts
             List<ConnectorTaskId> validTasks = entry.getValue().tasks().stream()
-                    .filter(task -> configuredConnectors.contains(task.connector()))
+                    .filter(task -> configuredTasks.contains(task))
                     .collect(Collectors.toList());
             
             worker.assignedTasks.addAll(validTasks);
@@ -515,12 +742,12 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         
         // Global targets
         targets.totalTasks = configuredTasks.size();
-        targets.globalMin = targets.totalTasks / numWorkers;
-        targets.globalMax = (targets.totalTasks + numWorkers - 1) / numWorkers;  // ceiling
-        targets.globalMaxLimit = targets.globalMax + 1;
+        targets.minTasksPerWorker = targets.totalTasks / numWorkers;
+        targets.maxTasksPerWorker = (targets.totalTasks + numWorkers - 1) / numWorkers;  // ceiling
+        targets.maxTasksPerWorkerMaxLimit = targets.maxTasksPerWorker + 3;  // Relaxed limit to prioritize per-consumer balance
         
         log.debug("Global targets - totalTasks: {}, globalMin: {}, globalMax: {}, globalMaxLimit: {}",
-                targets.totalTasks, targets.globalMin, targets.globalMax, targets.globalMaxLimit);
+                targets.totalTasks, targets.minTasksPerWorker, targets.maxTasksPerWorker, targets.maxTasksPerWorkerMaxLimit);
         
         // Per-consumer targets
         Map<String, Integer> taskCountsByConnector = new TreeMap<>();
@@ -532,12 +759,15 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
             int taskCount = taskCountsByConnector.getOrDefault(connector, 0);
             ConsumerTarget target = new ConsumerTarget();
             target.totalTasks = taskCount;
-            target.consumerNTaskCountMin = taskCount / numWorkers;
+            target.consumerNTaskCountMin = taskCount / numWorkers;  // floor
             target.consumerNTaskCountMax = (taskCount + numWorkers - 1) / numWorkers;  // ceiling
+            // maxWorkersWithMax = taskCount - (consumerNTaskCountMin × numWorkers)
+            // This is the maximum number of workers that should have consumerNTaskCountMax tasks
+            target.maxWorkersWithTaskCountMax = taskCount - (target.consumerNTaskCountMin * numWorkers);
             targets.perConsumerTargets.put(connector, target);
             
-            log.debug("Consumer targets - {}: totalTasks={}, consumerNTaskCountMin={}, consumerNTaskCountMax={}",
-                    connector, taskCount, target.consumerNTaskCountMin, target.consumerNTaskCountMax);
+            log.debug("Consumer targets - {}: totalTasks={}, consumerNTaskCountMin={}, consumerNTaskCountMax={}, maxWorkersWithMax={}",
+                    connector, target.totalTasks, target.consumerNTaskCountMin, target.consumerNTaskCountMax, target.maxWorkersWithTaskCountMax);
         }
         
         return targets;
@@ -659,6 +889,9 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
     
     /**
      * Identify deleted connectors and tasks that need to be revoked.
+     * This includes:
+     * 1. Tasks from deleted connectors (connector no longer exists)
+     * 2. Tasks with IDs that no longer exist (task count decreased)
      */
     private DeletionInfo identifyDeletions(
             Map<String, ConnectorsAndTasks> memberAssignments,
@@ -684,21 +917,23 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
             }
         }
         
-        // Revoke ALL tasks belonging to deleted connectors from ALL workers
-        if (!deletedConnectorNames.isEmpty()) {
-            for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
-                String worker = entry.getKey();
-                Collection<ConnectorTaskId> existingTasks = entry.getValue().tasks();
-                
-                List<ConnectorTaskId> deletedConnectorTasks = existingTasks.stream()
-                        .filter(task -> deletedConnectorNames.contains(task.connector()))
-                        .collect(Collectors.toList());
-                
-                if (!deletedConnectorTasks.isEmpty()) {
-                    info.taskRevocations.put(worker, deletedConnectorTasks);
-                    log.info("Revoking {} tasks from deleted connectors on worker {}",
-                            deletedConnectorTasks.size(), worker);
-                }
+        // Revoke ALL tasks belonging to deleted connectors OR with non-existent task IDs
+        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
+            String worker = entry.getKey();
+            Collection<ConnectorTaskId> existingTasks = entry.getValue().tasks();
+            
+            // Find tasks that should be revoked:
+            // 1. Tasks from deleted connectors
+            // 2. Tasks whose IDs no longer exist (task count decreased)
+            List<ConnectorTaskId> tasksToRevoke = existingTasks.stream()
+                    .filter(task -> deletedConnectorNames.contains(task.connector()) 
+                                    || !configuredTasks.contains(task))
+                    .collect(Collectors.toList());
+            
+            if (!tasksToRevoke.isEmpty()) {
+                info.taskRevocations.put(worker, tasksToRevoke);
+                log.info("Revoking {} tasks from worker {} (deleted connectors or decreased task count)",
+                        tasksToRevoke.size(), worker);
             }
         }
         
@@ -749,9 +984,9 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
      */
     static class BalanceTargets {
         int totalTasks;
-        int globalMin;
-        int globalMax;
-        int globalMaxLimit;
+        int minTasksPerWorker;
+        int maxTasksPerWorker;
+        int maxTasksPerWorkerMaxLimit;
         final Map<String, ConsumerTarget> perConsumerTargets = new TreeMap<>();
     }
     
@@ -762,6 +997,43 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
         int totalTasks;
         int consumerNTaskCountMin;
         int consumerNTaskCountMax;
+        int maxWorkersWithTaskCountMax;  // Maximum number of workers that should have consumerNTaskCountMax tasks
+    }
+    
+    /**
+     * Tracks all detected balance violations.
+     */
+    static class ViolationState {
+        List<WorkerState> overloadedWorkers = new ArrayList<>();
+        List<WorkerState> underloadedWorkers = new ArrayList<>();
+        List<ConsumerViolation> consumerOverloads = new ArrayList<>();
+        List<ConsumerViolation> consumerUnderloads = new ArrayList<>();
+        Set<ConnectorTaskId> unassignedTasks = new TreeSet<>();
+        
+        boolean hasOverloadViolations() {
+            return !overloadedWorkers.isEmpty() || !consumerOverloads.isEmpty();
+        }
+        
+        boolean hasUnderloadViolations() {
+            return !underloadedWorkers.isEmpty() || !consumerUnderloads.isEmpty();
+        }
+    }
+    
+    /**
+     * Represents a per-consumer violation for a specific worker.
+     */
+    static class ConsumerViolation {
+        WorkerState worker;
+        String consumer;
+        int actualCount;
+        ConsumerTarget target;
+        
+        ConsumerViolation(WorkerState worker, String consumer, int actualCount, ConsumerTarget target) {
+            this.worker = worker;
+            this.consumer = consumer;
+            this.actualCount = actualCount;
+            this.target = target;
+        }
     }
     
     /**

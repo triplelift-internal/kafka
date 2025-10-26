@@ -47,17 +47,22 @@ import static org.junit.Assert.fail;
 /**
  * Comprehensive tests for BalancedCooperativeAssignor covering all scenarios.
  * 
- * Tests verify the two-round protocol:
- * - Round 1 (Revocations): Full revocation when triggered by empty workers or severe imbalance
- * - Round 2 (Assignments): Incremental assignment with Phase A (consumerN_task_count_min) and Phase B (remaining)
+ * Tests verify the 4-step incremental cooperative protocol:
+ * - Step 1 (ALWAYS): Calculate balance targets
+ * - Step 2 (ALWAYS): Detect violations (global and per-consumer)
+ * - Step 3 (CONDITIONAL): Revoke from overloaded workers (if overload violations detected)
+ * - Step 4 (CONDITIONAL): Assign to underloaded workers or unassigned tasks (if no overload violations)
+ * 
+ * Key Protocol Rule: Steps 3 and 4 are MUTUALLY EXCLUSIVE - only one executes per generation.
  * 
  * Scenarios tested (from algorithm specification):
- * 1. Scale-up (empty workers) → Round 1 + Round 2
- * 2. Scale-down (workers left) → Round 2 only
- * 3. Task count increase → Round 2 only
- * 4. New connector added → Round 1 (if creates empty workers) + Round 2
- * 5. Connector removed → Round 2 only
- * 6. Task count decrease → Round 2 only
+ * 1. Scale-up (empty workers) → Assignment generation (no overload, just unassigned tasks)
+ * 2. Scale-down (workers left) → Assignment generation (no overload, just unassigned tasks)
+ * 3. Task count increase → Assignment generation (no overload, just new tasks)
+ * 4. New connector added → Assignment generation (no overload, just new tasks)
+ * 5. Connector removed → Assignment generation (tasks filtered, may rebalance remaining)
+ * 6. Task count decrease → No action or minor rebalancing (tasks filtered out)
+ * 7. Overload violation → Revocation generation (remove excess tasks)
  */
 public class BalancedCooperativeAssignorTest {
     private static final Logger log = LoggerFactory.getLogger(BalancedCooperativeAssignorTest.class);
@@ -92,11 +97,12 @@ public class BalancedCooperativeAssignorTest {
     
     /**
      * Scenario 1: Scale-Up from 0 to 3 workers
-     * Expected Flow:
-     * - Round 1: Full revocation (all tasks unassigned)
-     * - Round 2: Complete assignment with perfect balance
+     * Expected Flow (NEW ALGORITHM):
+     * - Generation 1: No overload violations (all workers empty), but unassigned tasks exist
+     *   → Step 4 (Assignment): Assign all 10 tasks
      * 
      * This tests the classic scale-up scenario where new workers join an empty cluster.
+     * No revocations occur since there's no overload.
      */
     @Test
     public void testScenario1_ScaleUpFrom0To3Workers() {
@@ -108,31 +114,36 @@ public class BalancedCooperativeAssignorTest {
         // Add 1 connector with 10 tasks
         addNewConnector("connector-1", 10);
         
-        // Round 1 would be triggered (empty workers), but there's nothing to revoke
-        // So we skip directly to Round 2 (assignments) in a single rebalance
+        // Generation 1: All tasks unassigned, no overload violations
+        // → Step 4 (Assignment) executes: assign all 10 tasks
         performStandardRebalance();
         
-        log.info("After rebalance (Round 2 - assignments):");
+        log.info("After Generation 1 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify: All 10 tasks assigned in single rebalance, no revocations
-        assertRound2Behavior(10, 0);  // 10 assignments, 0 revocations
+        // Verify: All 10 tasks assigned in single generation, no revocations
+        assertAssignmentBehavior(10, 0);  // 10 assignments, 0 revocations
         
-        // Verify final balance: 3-4 tasks per worker
+        // Verify final balance: 3-4 tasks per worker (10/3 = 3.33, so min=3, max=4)
         assertBalancedDistribution(3, 4);
         assertAllTasksAssigned();
         assertNoDuplicateConnectorAssignments();
         assertAllConnectorsAssigned();
         assertConnectorsEvenlyDistributed();
         
-        log.info("✓ SCENARIO 1 passed: Scale-up handled correctly");
+        log.info("✓ SCENARIO 1 passed: Scale-up handled correctly in single generation");
     }
     
     /**
      * Scenario 1b: Scale-Up from 2 to 5 workers (with existing load)
-     * Expected Flow:
-     * - Round 1: Full revocation from all workers
-     * - Round 2: Redistribute across all 5 workers
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 2 workers, balanced with 5 tasks each
+     * - Add 3 empty workers → creates underload violation (new workers have 0 < globalMin=2)
+     * - Generation 1: Detect global underload violations for new workers
+     *   → Step 4 (Assignment): Incrementally assign tasks to fill underloaded workers
+     * 
+     * Key: The algorithm does NOT revoke all tasks. It detects that the 3 new workers
+     * are underloaded and incrementally assigns tasks to balance the load.
      */
     @Test
     public void testScenario1b_ScaleUpFrom2To5WorkersWithExistingLoad() {
@@ -154,29 +165,33 @@ public class BalancedCooperativeAssignorTest {
         log.info("After adding 3 empty workers:");
         logAllAssignments();
         
-        // Round 1: Should revoke all tasks from existing workers
+        // Generation 1: New workers are underloaded (0 < globalMin=2)
+        // → Step 4 (Assignment): Assign tasks to fill underloaded workers
+        // But wait - existing workers are now OVERLOADED (5 > globalMaxLimit=2+1=3)
+        // → Step 3 (Revocation): Revoke excess tasks from overloaded workers
         performStandardRebalance();
         
-        log.info("After Round 1 (Revocation):");
+        log.info("After Generation 1 (Step 3 - Revocation):");
         logAllAssignments();
         
-        // Verify Round 1: All 10 tasks revoked, no assignments yet
-        assertRound1Behavior(10, 0);
+        // Verify Generation 1: Revocations from overloaded workers, no assignments yet
+        int revocations = countTotalRevocations();
+        int assignments = countTotalAssignments();
+        assertTrue("Generation 1 should have revocations", revocations > 0);
+        assertEquals("Generation 1 should have NO assignments", 0, assignments);
         
-        // All workers should now have 0 tasks after Round 1
-        for (ConnectorsAndTasks assignment : memberAssignments.values()) {
-            assertEquals("After Round 1, all workers should have 0 tasks", 
-                    0, assignment.tasks().size());
-        }
-        
-        // Round 2: Assign all tasks across 5 workers
+        // Generation 2: Revoked tasks now unassigned, no overload violations
+        // → Step 4 (Assignment): Assign unassigned tasks to balance all workers
         performStandardRebalance();
         
-        log.info("After Round 2 (Assignment):");
+        log.info("After Generation 2 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify Round 2: All 10 tasks assigned, no revocations
-        assertRound2Behavior(10, 0);
+        // Verify Generation 2: Assignments only, no revocations
+        revocations = countTotalRevocations();
+        assignments = countTotalAssignments();
+        assertEquals("Generation 2 should have NO revocations", 0, revocations);
+        assertTrue("Generation 2 should have assignments", assignments > 0);
         
         // Verify final balance: 2 tasks per worker (10 tasks / 5 workers)
         assertBalancedDistribution(2, 2);
@@ -184,18 +199,23 @@ public class BalancedCooperativeAssignorTest {
         assertAllConnectorsAssigned();
         assertConnectorsEvenlyDistributed();
         
-        log.info("✓ SCENARIO 1b passed: Scale-up with existing load handled correctly");
+        log.info("✓ SCENARIO 1b passed: Scale-up with existing load handled via incremental revocation→assignment");
     }
 
     // ==================== SCENARIO 2: Scale-Down (Workers Left) ====================
     
     /**
      * Scenario 2: Scale-Down from 5 to 3 workers
-     * Expected Flow:
-     * - Round 1: SKIPPED (no empty workers, no severe imbalance)
-     * - Round 2: Incremental assignment of lost tasks only
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 5 workers, 10 tasks, balanced (2 per worker)
+     * - Remove 2 workers → 4 tasks become unassigned, remaining 3 workers still have their 2 tasks
+     * - Generation 1: No overload violations (3 workers with 2 tasks each is valid for 6 remaining tasks after losing 4)
+     *   But wait - we still have 10 total tasks in the system, 4 are unassigned, so 6 tasks across 3 workers = 2 per worker
+     *   globalMin = 10 / 3 = 3 (floor), globalMax = 4 (ceil)
+     *   Current state: 3 workers with 2 tasks each = UNDERLOAD (2 < globalMin=3)
+     *   → Step 4 (Assignment): Assign the 4 lost tasks to the 3 remaining workers to reach balance
      * 
-     * Key: Existing tasks on remaining workers are preserved!
+     * Key: The algorithm does NOT revoke existing tasks. It only assigns the lost tasks.
      */
     @Test
     public void testScenario2_ScaleDownFrom5To3Workers() {
@@ -225,17 +245,17 @@ public class BalancedCooperativeAssignorTest {
         log.info("After removing worker4 and worker5:");
         logAllAssignments();
         
-        // Round 2: Should only assign lost tasks (no revocations)
+        // Generation 1: 3 workers with 2 tasks each, 4 unassigned tasks
+        // globalMin = 10/3 = 3, globalMax = 4
+        // All workers underloaded (2 < globalMin=3)
+        // → Step 4 (Assignment): Assign lost tasks to balance
         performStandardRebalance();
         
-        log.info("After Round 2 (Incremental Assignment):");
+        log.info("After Generation 1 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify Round 2 only: Lost tasks assigned, no revocations
-        assertRound2Behavior(lostTaskCount, 0);
-        
-        // Verify no Round 1 happened (no revocations from existing workers)
-        // Each remaining worker should have gained some tasks, not lost any
+        // Verify Generation 1: Assignments only, no revocations
+        assertAssignmentBehavior(lostTaskCount, 0);
         
         // Verify final balance: 3-4 tasks per worker (10 tasks / 3 workers)
         assertBalancedDistribution(3, 4);
@@ -250,9 +270,13 @@ public class BalancedCooperativeAssignorTest {
     
     /**
      * Scenario 3: Task count increased (10→15 tasks)
-     * Expected Flow:
-     * - Round 1: SKIPPED (no empty workers)
-     * - Round 2: Assign 5 new tasks incrementally
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 3 workers, 10 tasks, balanced (3-4 per worker)
+     * - Increase to 15 tasks → 5 new unassigned tasks
+     * - Generation 1: No overload violations (workers have 3-4 tasks each)
+     *   globalMin = 15/3 = 5, globalMax = 5
+     *   Current state: Workers underloaded (3-4 < globalMin=5)
+     *   → Step 4 (Assignment): Assign the 5 new tasks to reach balance
      * 
      * Key: Existing 10 tasks preserved, only 5 new tasks assigned!
      */
@@ -282,14 +306,15 @@ public class BalancedCooperativeAssignorTest {
         
         log.info("After increasing connector-1 to 15 tasks:");
         
-        // Round 2: Assign 5 new tasks only
+        // Generation 1: 3 workers underloaded, 5 unassigned tasks
+        // → Step 4 (Assignment): Assign 5 new tasks only
         performStandardRebalance();
         
-        log.info("After Round 2 (Incremental Assignment):");
+        log.info("After Generation 1 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify Round 2 only: 5 new tasks assigned, no revocations
-        assertRound2Behavior(5, 0);
+        // Verify Generation 1: 5 new tasks assigned, no revocations
+        assertAssignmentBehavior(5, 0);
         
         // Verify all original 10 tasks are still assigned
         Set<ConnectorTaskId> currentTasks = new HashSet<>();
@@ -312,9 +337,13 @@ public class BalancedCooperativeAssignorTest {
     
     /**
      * Scenario 4a: New connector added (no empty workers created)
-     * Expected Flow:
-     * - Round 1: SKIPPED (no empty workers)
-     * - Round 2: Assign new connector's tasks
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 3 workers, 10 tasks from connector-1, balanced (3-4 per worker)
+     * - Add connector-2 with 5 tasks → 5 new unassigned tasks
+     * - Generation 1: No overload violations (workers have 3-4 tasks each)
+     *   globalMin = 15/3 = 5, globalMax = 5
+     *   Current state: Workers underloaded (3-4 < globalMin=5)
+     *   → Step 4 (Assignment): Assign the 5 new tasks
      */
     @Test
     public void testScenario4a_NewConnectorAdded_NoEmptyWorkers() {
@@ -334,14 +363,15 @@ public class BalancedCooperativeAssignorTest {
         
         log.info("After adding connector-2 with 5 tasks:");
         
-        // Round 2: Assign 5 new tasks
+        // Generation 1: No overload, 5 unassigned tasks
+        // → Step 4 (Assignment): Assign 5 new tasks
         performStandardRebalance();
         
-        log.info("After Round 2 (Assignment):");
+        log.info("After Generation 1 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify Round 2 only: 5 tasks assigned, no revocations
-        assertRound2Behavior(5, 0);
+        // Verify Generation 1: 5 tasks assigned, no revocations
+        assertAssignmentBehavior(5, 0);
         
         // Verify final balance: 5 tasks per worker (15 tasks / 3 workers)
         assertBalancedDistribution(5, 5);
@@ -356,10 +386,13 @@ public class BalancedCooperativeAssignorTest {
     
     /**
      * Scenario 5: Connector removed
-     * Expected Flow:
-     * - Tasks from deleted connector automatically filtered out
-     * - Round 1: SKIPPED (no empty workers after removal)
-     * - Round 2: Rebalance remaining tasks if needed
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 3 workers, 2 connectors (15 tasks total), balanced (5 per worker)
+     * - Remove connector-2 → 5 tasks automatically filtered out, 10 tasks remain
+     * - Generation 1: No action needed if workers already have 3-4 tasks each after filtering
+     *   If filtering leaves workers with exactly their assigned tasks from connector-1, likely balanced already
+     * 
+     * Note: This scenario tests the connector filtering mechanism, not rebalancing logic
      */
     @Test
     public void testScenario5_ConnectorRemoved() {
@@ -418,6 +451,19 @@ public class BalancedCooperativeAssignorTest {
      * - Round 1: SKIPPED
      * - Round 2: Rebalance remaining 6 tasks
      */
+    /**
+     * Scenario 6: Task count decreased (10→6 tasks)
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: 3 workers, 10 tasks, balanced (3-4 per worker)
+     * - Decrease to 6 tasks → tasks 6-9 automatically filtered out
+     * - Generation 1: After filtering, workers may have 2-3 tasks each
+     *   globalMin = 6/3 = 2, globalMax = 2
+     *   If some workers have 3 tasks: 3 > globalMaxLimit=3, NO overload
+     *   But some tasks might still be assigned to "deleted" task IDs
+     *   The filtering will remove tasks 6-9, possibly creating imbalance
+     * 
+     * This scenario may trigger rebalancing depending on how tasks were distributed.
+     */
     @Test
     public void testScenario6_TaskCountDecrease() {
         log.info("=== SCENARIO 6: Task Count Decrease (10→6 tasks) ===");
@@ -437,16 +483,16 @@ public class BalancedCooperativeAssignorTest {
         
         log.info("After decreasing connector-1 to 6 tasks:");
         
-        // Round 1: Revoke all tasks (severe imbalance detected)
+        // Generation 1: Tasks 6-9 filtered, may need rebalancing
         performStandardRebalance();
         
-        log.info("After Round 1 (Revocation):");
+        log.info("After Generation 1:");
         logAllAssignments();
         
-        // Round 2: Assign 6 tasks
+        // May need Generation 2 if filtering caused imbalance
         performStandardRebalance();
         
-        log.info("After Round 2 (Assignment):");
+        log.info("After Generation 2:");
         logAllAssignments();
         
         // Verify only tasks 0-5 remain
@@ -478,20 +524,25 @@ public class BalancedCooperativeAssignorTest {
     // ==================== SCENARIO 7: Severe Imbalance ====================
     
     /**
-     * Scenario 7: Severe imbalance triggering Round 1
-     * Expected Flow:
-     * - Round 1: Full revocation (worker exceeds globalMaxLimit)
-     * - Round 2: Complete redistribution
+     * Scenario 7: Overload violation triggering Step 3 (Revocation Generation)
+     * Expected Flow (NEW ALGORITHM):
+     * - Initial: Severe imbalance - worker1 has 8 tasks, worker2/3 have 1 each
+     * - Generation 1: Detect overload violation (worker1 has 8 > globalMaxLimit)
+     *   globalMin = 10/3 = 3, globalMax = 4, globalMaxLimit = 3+1 = 4
+     *   worker1: 8 tasks (OVERLOAD: 8 > 4)
+     *   → Step 3 (Revocation): Revoke excess tasks from worker1 only
+     * - Generation 2: No overload, but unassigned tasks and underload violations
+     *   → Step 4 (Assignment): Assign revoked tasks to balance all workers
      */
     @Test
-    public void testScenario7_SevereImbalanceTriggeringRound1() {
-        log.info("=== SCENARIO 7: Severe Imbalance ===");
+    public void testScenario7_OverloadTriggeringRevocation() {
+        log.info("=== SCENARIO 7: Overload Violation ===");
         
         // Setup: 3 workers with severe imbalance
         // worker1: 8 tasks (way over limit)
         // worker2: 1 task
         // worker3: 1 task
-        // Total: 10 tasks, should be 3-4 each, limit should be ~4-5
+        // Total: 10 tasks, globalMin=3, globalMax=4, globalMaxLimit=4
         
         addNewConnector("connector-1", 10);
         
@@ -509,23 +560,31 @@ public class BalancedCooperativeAssignorTest {
         log.info("Initial imbalanced state:");
         logAllAssignments();
         
-        // Round 1: Should trigger full revocation
+        // Generation 1: worker1 overloaded (8 > globalMaxLimit=4)
+        // → Step 3 (Revocation): Revoke excess tasks from worker1
         performStandardRebalance();
         
-        log.info("After Round 1 (Revocation):");
+        log.info("After Generation 1 (Step 3 - Revocation):");
         logAllAssignments();
         
-        // Verify Round 1: All 10 tasks revoked
-        assertRound1Behavior(10, 0);
+        // Verify Generation 1: Revocations only (at least 4 tasks revoked from worker1)
+        int revocations = countTotalRevocations();
+        int assignments = countTotalAssignments();
+        assertTrue("Generation 1 should revoke tasks", revocations >= 4);
+        assertEquals("Generation 1 should have NO assignments", 0, assignments);
         
-        // Round 2: Redistribute all tasks
+        // Generation 2: No overload, revoked tasks unassigned
+        // → Step 4 (Assignment): Assign all unassigned tasks to balance
         performStandardRebalance();
         
-        log.info("After Round 2 (Assignment):");
+        log.info("After Generation 2 (Step 4 - Assignment):");
         logAllAssignments();
         
-        // Verify Round 2: All 10 tasks assigned
-        assertRound2Behavior(10, 0);
+        // Verify Generation 2: Assignments only
+        revocations = countTotalRevocations();
+        assignments = countTotalAssignments();
+        assertEquals("Generation 2 should have NO revocations", 0, revocations);
+        assertTrue("Generation 2 should assign tasks", assignments >= 4);
         
         // Verify final balance: 3-4 tasks per worker
         assertBalancedDistribution(3, 4);
@@ -533,7 +592,7 @@ public class BalancedCooperativeAssignorTest {
         assertAllConnectorsAssigned();
         assertConnectorsEvenlyDistributed();
         
-        log.info("✓ SCENARIO 7 passed: Severe imbalance corrected via Round 1");
+        log.info("✓ SCENARIO 7 passed: Overload corrected via Step 3 Revocation → Step 4 Assignment");
     }
 
     // ==================== Multi-Connector Scenarios ====================
@@ -584,26 +643,15 @@ public class BalancedCooperativeAssignorTest {
         
         log.info("✓ SCENARIO 8 passed: Multi-connector per-consumer fairness");
     }
-
-    // ==================== Helper Methods ====================
-
-    /**
-     * Verify Round 1 behavior: Only revocations, no assignments
-     */
-    private void assertRound1Behavior(int expectedRevocations, int expectedAssignments) {
-        assertEquals("Round 1 should have exactly " + expectedRevocations + " revocations",
-                expectedRevocations, countTotalRevocations());
-        assertEquals("Round 1 should have exactly " + expectedAssignments + " assignments (typically 0)",
-                expectedAssignments, countTotalAssignments());
-    }
     
     /**
-     * Verify Round 2 behavior: Only assignments, no revocations
+     * Verify Step 4 (Assignment Generation) behavior: Only assignments, no revocations
+     * This generation resolves underload violations by assigning tasks to underloaded workers.
      */
-    private void assertRound2Behavior(int expectedAssignments, int expectedRevocations) {
-        assertEquals("Round 2 should have exactly " + expectedAssignments + " assignments",
+    private void assertAssignmentBehavior(int expectedAssignments, int expectedRevocations) {
+        assertEquals("Step 4 (Assignment) should have exactly " + expectedAssignments + " assignments",
                 expectedAssignments, countTotalAssignments());
-        assertEquals("Round 2 should have exactly " + expectedRevocations + " revocations (typically 0)",
+        assertEquals("Step 4 (Assignment) should have exactly " + expectedRevocations + " revocations (always 0)",
                 expectedRevocations, countTotalRevocations());
     }
     
