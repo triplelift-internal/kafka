@@ -182,6 +182,18 @@ public class DistributedConfig extends WorkerConfig {
             + "period the connectors and tasks of the departed workers remain unassigned";
     public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));
 
+    /**
+     * <code>worker.join.delay.ms</code>
+     */
+    public static final String WORKER_JOIN_DELAY_MS_CONFIG = "worker.join.delay.ms";
+    public static final String WORKER_JOIN_DELAY_MS_DOC = "The delay in milliseconds to wait for additional workers "
+            + "to join the cluster before triggering task rebalancing and assignment. This is particularly useful in "
+            + "environments with spot instances or autoscaling where multiple workers may join in quick succession. "
+            + "By delaying the rebalance, the cluster can avoid multiple consecutive rebalances and achieve a more "
+            + "stable assignment. This delay only applies when new workers join; it does not affect rebalances triggered "
+            + "by workers leaving the cluster. A value of 0 means rebalance immediately when any worker joins (default behavior).";
+    public static final int WORKER_JOIN_DELAY_MS_DEFAULT = 0;
+
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys. "
@@ -242,6 +254,18 @@ public class DistributedConfig extends WorkerConfig {
             + "For more information on this feature, see the "
             + "<a href=\"https://kafka.apache.org/documentation.html#connect_exactlyoncesource\">exactly-once source support documentation</a>.";
     public static final String EXACTLY_ONCE_SOURCE_SUPPORT_DEFAULT = ExactlyOnceSourceSupport.DISABLED.toString();
+
+    /**
+     * <code>task.assignment.strategy</code>
+     */
+    public static final String TASK_ASSIGNMENT_STRATEGY_CONFIG = "task.assignment.strategy";
+    public static final String TASK_ASSIGNMENT_STRATEGY_DOC = "The strategy to use when assigning tasks to workers during rebalancing. "
+            + "When set to 'balanced', tasks from the same connector are distributed evenly across all workers to prevent task clustering "
+            + "and ensure better fault tolerance and load distribution. This is especially beneficial for multi-tenant environments and "
+            + "connectors with high task counts. When set to 'default', tasks are assigned in their natural order which may result in "
+            + "multiple tasks from the same connector being assigned to the same worker.";
+    public static final String TASK_ASSIGNMENT_STRATEGY_DEFAULT = "default";
+    public static final String TASK_ASSIGNMENT_STRATEGY_BALANCED = "balanced";
 
     private static Object defaultKeyGenerationAlgorithm(Crypto crypto) {
         try {
@@ -469,6 +493,12 @@ public class DistributedConfig extends WorkerConfig {
                     between(0, Integer.MAX_VALUE),
                     ConfigDef.Importance.LOW,
                     SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC)
+            .define(WORKER_JOIN_DELAY_MS_CONFIG,
+                    ConfigDef.Type.INT,
+                    WORKER_JOIN_DELAY_MS_DEFAULT,
+                    between(0, Integer.MAX_VALUE),
+                    ConfigDef.Importance.LOW,
+                    WORKER_JOIN_DELAY_MS_DOC)
             .define(INTER_WORKER_KEY_TTL_MS_CONFIG,
                     ConfigDef.Type.INT,
                     INTER_WORKER_KEY_TTL_MS_MS_DEFAULT,
@@ -503,7 +533,13 @@ public class DistributedConfig extends WorkerConfig {
                             (name, value) -> validateVerificationAlgorithms(crypto, name, (List<String>) value),
                             () -> "A list of one or more MAC algorithms, each supported by the worker JVM"),
                     ConfigDef.Importance.LOW,
-                    INTER_WORKER_VERIFICATION_ALGORITHMS_DOC);
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_DOC)
+            .define(TASK_ASSIGNMENT_STRATEGY_CONFIG,
+                    ConfigDef.Type.STRING,
+                    TASK_ASSIGNMENT_STRATEGY_DEFAULT,
+                    in("default", "balanced"),
+                    ConfigDef.Importance.MEDIUM,
+                    TASK_ASSIGNMENT_STRATEGY_DOC);
     }
 
     private final ExactlyOnceSourceSupport exactlyOnceSourceSupport;
@@ -610,6 +646,14 @@ public class DistributedConfig extends WorkerConfig {
 
     public Map<String, Object> statusStorageTopicSettings() {
         return topicSettings(STATUS_STORAGE_PREFIX);
+    }
+
+    /**
+     * @return whether the balanced cooperative assignor is enabled for task assignment. When enabled, tasks from the same connector
+     * are distributed evenly across all workers to prevent task clustering.
+     */
+    public boolean isBalancedCooperativeAssignorEnabled() {
+        return TASK_ASSIGNMENT_STRATEGY_BALANCED.equalsIgnoreCase(getString(TASK_ASSIGNMENT_STRATEGY_CONFIG));
     }
 
     private void validateInterWorkerKeyConfigs() {

@@ -62,9 +62,9 @@ import static org.apache.kafka.connect.util.ConnectUtils.transformValues;
  *
  */
 public class IncrementalCooperativeAssignor implements ConnectAssignor {
-    private final Logger log;
-    private final Time time;
-    private final int maxDelay;
+    protected final Logger log;
+    protected final Time time;
+    protected final int maxDelay;
     private ConnectorsAndTasks previousAssignment;
     private final ConnectorsAndTasks previousRevocation;
     private boolean revokedInPrevious;
@@ -630,7 +630,7 @@ public class IncrementalCooperativeAssignor implements ConnectAssignor {
      * @return which connectors and tasks should be revoked from which workers; never null, but may be empty
      * if no load-balancing revocations are necessary or possible
      */
-    private Map<String, ConnectorsAndTasks> performLoadBalancingRevocations(
+    protected Map<String, ConnectorsAndTasks> performLoadBalancingRevocations(
             ConnectorsAndTasks configured,
             Collection<WorkerLoad> workers
     ) {
@@ -676,7 +676,7 @@ public class IncrementalCooperativeAssignor implements ConnectAssignor {
         return buildAll(result);
     }
 
-    private <E> Map<String, Set<E>> loadBalancingRevocations(
+    protected <E> Map<String, Set<E>> loadBalancingRevocations(
             String allocatedResourceName,
             int totalToAllocate,
             Collection<WorkerLoad> workers,

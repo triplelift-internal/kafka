@@ -158,7 +158,8 @@ public class WorkerCoordinatorTest {
                                                  configStorage,
                                                  rebalanceListener,
                                                  compatibility,
-                                                 0);
+                                                 0,
+                                                 new IncrementalCooperativeAssignor(logContext, time, 0));
 
         configState1 = new ClusterConfigState(
                 4L,

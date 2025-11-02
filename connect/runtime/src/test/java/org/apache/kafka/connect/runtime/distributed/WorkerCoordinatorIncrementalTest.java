@@ -173,7 +173,8 @@ public class WorkerCoordinatorIncrementalTest {
                                                  configStorage,
                                                  rebalanceListener,
                                                  compatibility,
-                                                 rebalanceDelay);
+                                                 rebalanceDelay,
+                                                 new IncrementalCooperativeAssignor(loggerFactory, time, rebalanceDelay));
 
         configState1 = clusterConfigState(offset, 2, 4);
     }

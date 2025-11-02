@@ -124,6 +124,17 @@ public class WorkerGroupMember {
                     retryBackoffMs,
                     config.getInt(CommonClientConfigs.REQUEST_TIMEOUT_MS_CONFIG),
                     Integer.MAX_VALUE);
+
+            // Create the appropriate assignor based on configuration
+            int maxDelay = config.getInt(DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG);
+            int workerJoinDelayMs = config.getInt(DistributedConfig.WORKER_JOIN_DELAY_MS_CONFIG);
+            ConnectAssignor assignor;
+            if (config.isBalancedCooperativeAssignorEnabled()) {
+                assignor = new BalancedCooperativeAssignor(logContext, time, maxDelay, workerJoinDelayMs);
+            } else {
+                assignor = new IncrementalCooperativeAssignor(logContext, time, maxDelay);
+            }
+
             this.coordinator = new WorkerCoordinator(
                     new GroupRebalanceConfig(config, GroupRebalanceConfig.ProtocolType.CONNECT),
                     logContext,
@@ -135,7 +146,8 @@ public class WorkerGroupMember {
                     configStorage,
                     listener,
                     ConnectProtocolCompatibility.compatibility(config.getString(DistributedConfig.CONNECT_PROTOCOL_CONFIG)),
-                    config.getInt(DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG));
+                    maxDelay,
+                    assignor);
 
             AppInfoParser.registerAppInfo(JMX_PREFIX, clientId, metrics, time.milliseconds());
             log.debug("Connect group member created");
