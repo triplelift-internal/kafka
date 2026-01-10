@@ -5,6 +5,8 @@ target/
 build/
 build_eclipse/
 out/
+bin/
+/*bin
 .gradle/
 .vscode/
 lib_managed/
@@ -32,10 +34,12 @@ Vagrantfile.local
 /logs
 .DS_Store
 
+# Allow Gradle wrapper jar file
+!gradle/wrapper/gradle-wrapper.jar
+
 config/server-*
 config/zookeeper-*
 core/data/*
-gradle/wrapper/*.jar
 gradlew.bat
 
 results

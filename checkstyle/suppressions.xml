@@ -157,6 +157,9 @@
     <suppress checks="NPathComplexity"
               files="(DistributedHerder|RestClient|RestServer|JsonConverter|KafkaConfigBackingStore|FileStreamSourceTask|WorkerSourceTask|TopicAdmin).java"/>
 
+    <suppress checks="(CyclomaticComplexity|MethodLength|JavaNCSS|NPathComplexity)"
+              files="BalancedCooperativeAssignor.java"/>
+
     <!-- connect tests-->
     <suppress checks="ClassDataAbstractionCoupling"
               files="(DistributedHerder|KafkaBasedLog|WorkerSourceTaskWithTopicCreation|WorkerSourceTask)Test.java"/>

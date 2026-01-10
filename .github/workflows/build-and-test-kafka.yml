@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build and Test Kafka
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "3.6.2-tl"]
+
+jobs:
+  build_test_and_upload_kafka:
+    name: Build and Test Kafka
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@v1
+        
+      - name: Clean build directory
+        run: ./gradlew clean
+              
+      - name: Build Kafka with compatible Protobuf version and skip all tests
+        run: |
+          ./gradlew build -x test -Porg.gradle.jvmargs="-Dprotobuf.version=3.25.5" \
+            -Dprotobuf.version=3.25.5
+
+      - name: Run Kafka Connect Tests
+        run: |
+          ./gradlew :connect:runtime:test
