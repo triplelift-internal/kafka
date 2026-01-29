@@ -20,19 +20,18 @@ import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.ConnectorsAndTasks;
 import org.apache.kafka.connect.runtime.distributed.WorkerCoordinator.WorkerLoad;
-import org.apache.kafka.connect.storage.ClusterConfigState;
 import org.apache.kafka.connect.util.ConnectorTaskId;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * An enhanced assignor that extends {@link IncrementalCooperativeAssignor} to provide balanced
@@ -54,8 +53,6 @@ import java.util.Set;
  *       manner to maintain balanced distribution</li>
  *   <li><b>Load-Aware Revocations:</b> Revocations consider connector distribution to avoid
  *       re-clustering during scale-up/scale-down events</li>
- *   <li><b>Worker Join Delay:</b> Optionally delays rebalancing when new workers join to allow
- *       multiple workers to join before triggering rebalance, reducing churn in autoscaling environments</li>
  * </ul>
  * 
  * <p><b>Example:</b></p>
@@ -82,11 +79,6 @@ import java.util.Set;
  */
 public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor {
 
-    private final int workerJoinDelayMs;
-    private long workerJoinScheduledRebalance;
-    private int workerJoinDelay;
-    private Set<String> membersInPreviousRebalance;
-
     /**
      * Constructs a new BalancedCooperativeAssignor with interleaved assignment and revocation strategies.
      *
@@ -95,225 +87,169 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
      * @param maxDelay the maximum delay for scheduled rebalances in milliseconds
      */
     public BalancedCooperativeAssignor(LogContext logContext, Time time, int maxDelay) {
-        this(logContext, time, maxDelay, 0);
-    }
-
-    /**
-     * Constructs a new BalancedCooperativeAssignor with interleaved assignment and revocation strategies.
-     *
-     * @param logContext the log context for logging
-     * @param time the time implementation for scheduling
-     * @param maxDelay the maximum delay for scheduled rebalances in milliseconds
-     * @param workerJoinDelayMs the delay in milliseconds to wait for additional workers to join before rebalancing
-     */
-    public BalancedCooperativeAssignor(LogContext logContext, Time time, int maxDelay, int workerJoinDelayMs) {
         super(logContext, time, maxDelay);
-        this.workerJoinDelayMs = workerJoinDelayMs;
-        this.workerJoinScheduledRebalance = 0;
-        this.workerJoinDelay = 0;
-        this.membersInPreviousRebalance = Collections.emptySet();
     }
 
     /**
-     * Override to add worker join delay logic before performing task assignment.
-     * This method detects when new workers join and delays the rebalancing process to allow
-     * multiple workers to join in succession without triggering multiple rebalances.
-     */
-    @Override
-    ClusterAssignment performTaskAssignment(
-            ClusterConfigState configSnapshot,
-            int lastCompletedGenerationId,
-            int currentGenerationId,
-            Map<String, ConnectorsAndTasks> memberAssignments
-    ) {
-        // Detect if new workers have joined
-        Set<String> currentMembers = memberAssignments.keySet();
-        Set<String> newMembers = new HashSet<>(currentMembers);
-        newMembers.removeAll(membersInPreviousRebalance);
-        
-        // Detect if workers have left
-        Set<String> departedMembers = new HashSet<>(membersInPreviousRebalance);
-        departedMembers.removeAll(currentMembers);
-        boolean hasWorkersLeft = !departedMembers.isEmpty();
-        
-        boolean hasNewWorkers = !newMembers.isEmpty();
-        long now = time.milliseconds();
-        
-        // If workers have left, we must cancel any pending worker join delay and rebalance immediately
-        if (hasWorkersLeft && workerJoinScheduledRebalance > 0) {
-            log.info("Detected {} worker(s) leaving: {}. Cancelling worker join delay and rebalancing immediately.",
-                    departedMembers.size(), departedMembers);
-            resetWorkerJoinDelay();
-        }
-        
-        if (workerJoinDelayMs > 0 && hasNewWorkers && !hasWorkersLeft) {
-            log.info("Detected {} new worker(s) joining: {}. Worker join delay is {} ms",
-                    newMembers.size(), newMembers, workerJoinDelayMs);
-            
-            // If this is the first detection of new workers, schedule the rebalance
-            if (workerJoinScheduledRebalance == 0) {
-                workerJoinDelay = workerJoinDelayMs;
-                workerJoinScheduledRebalance = now + workerJoinDelay;
-                log.info("Scheduling rebalance for {} ms from now at timestamp {}",
-                        workerJoinDelay, workerJoinScheduledRebalance);
-            }
-            
-            // Check if the scheduled rebalance time has been reached
-            if (now < workerJoinScheduledRebalance) {
-                // Still waiting for more workers to join
-                int remainingDelay = (int) (workerJoinScheduledRebalance - now);
-                log.info("Worker join delay in progress. Delaying rebalance for {} ms. " +
-                        "Scheduled rebalance time: {}, current time: {}",
-                        remainingDelay, workerJoinScheduledRebalance, now);
-                
-                // Update members but return empty assignment to maintain current state
-                membersInPreviousRebalance = currentMembers;
-                
-                // Return an assignment that maintains the current state without changes
-                // This is critical: we need to preserve existing assignments during the delay
-                return createNoChangeAssignment(memberAssignments);
-            } else {
-                // Delay has expired, proceed with rebalancing
-                log.info("Worker join delay expired. Proceeding with rebalancing. " +
-                        "Total new workers that joined during delay: {}",
-                        newMembers.size());
-                resetWorkerJoinDelay();
-            }
-        } else if (workerJoinScheduledRebalance > 0 && !hasNewWorkers && !hasWorkersLeft) {
-            // No new workers and no departures, but we had a scheduled rebalance - reset it
-            log.info("No new workers detected. Resetting worker join delay.");
-            resetWorkerJoinDelay();
-        }
-        
-        // Update the member tracking for next rebalance
-        membersInPreviousRebalance = currentMembers;
-        
-        // Proceed with normal assignment logic
-        return super.performTaskAssignment(configSnapshot, lastCompletedGenerationId, 
-                currentGenerationId, memberAssignments);
-    }
-
-    /**
-     * Creates a ClusterAssignment that maintains the current state without any changes.
-     * This is used during the worker join delay period to prevent premature rebalancing.
-     */
-    private ClusterAssignment createNoChangeAssignment(Map<String, ConnectorsAndTasks> memberAssignments) {
-        // Build the current state as "all assigned" with no new assignments or revocations
-        Map<String, Collection<String>> allAssignedConnectors = new HashMap<>();
-        Map<String, Collection<ConnectorTaskId>> allAssignedTasks = new HashMap<>();
-        
-        for (Map.Entry<String, ConnectorsAndTasks> entry : memberAssignments.entrySet()) {
-            String worker = entry.getKey();
-            ConnectorsAndTasks assignment = entry.getValue();
-            allAssignedConnectors.put(worker, new ArrayList<>(assignment.connectors()));
-            allAssignedTasks.put(worker, new ArrayList<>(assignment.tasks()));
-        }
-        
-        // Return a ClusterAssignment with no changes - empty new assignments and revocations
-        return new ClusterAssignment(
-                Collections.emptyMap(),  // newlyAssignedConnectors
-                Collections.emptyMap(),  // newlyAssignedTasks
-                Collections.emptyMap(),  // newlyRevokedConnectors
-                Collections.emptyMap(),  // newlyRevokedTasks
-                allAssignedConnectors,   // allAssignedConnectors - preserve current state
-                allAssignedTasks         // allAssignedTasks - preserve current state
-        );
-    }
-
-    /**
-     * Resets the worker join delay state after a rebalance completes or is no longer needed.
-     */
-    private void resetWorkerJoinDelay() {
-        if (workerJoinScheduledRebalance != 0 || workerJoinDelay != 0) {
-            log.debug("Resetting worker join delay from scheduled rebalance: {} and delay: {}",
-                    workerJoinScheduledRebalance, workerJoinDelay);
-        }
-        workerJoinScheduledRebalance = 0;
-        workerJoinDelay = 0;
-    }
-
-    /**
-     * Interleaves tasks from different connectors to ensure even distribution across workers.
-     * This prevents task clustering where all tasks from one connector end up on the same worker.
+     * Performs connector-aware task assignment to ensure even distribution of tasks from each
+     * connector across all workers. This prevents task clustering where many tasks from the same
+     * connector end up on the same worker.
      * 
      * <p><b>Algorithm:</b></p>
      * <ol>
-     *   <li>Group tasks by connector name</li>
-     *   <li>Sort connector names for deterministic ordering</li>
-     *   <li>Perform round-robin selection across connectors</li>
+     *   <li>Group tasks by connector for deterministic processing</li>
+     *   <li>For each task, find the worker with:
+     *     <ul>
+     *       <li>Fewest tasks from that specific connector</li>
+     *       <li>If tied, pick the worker with fewest total tasks</li>
+     *       <li>If still tied, pick deterministically by worker name</li>
+     *     </ul>
+     *   </li>
+     *   <li>Track per-connector-per-worker counts to maintain balance</li>
      * </ol>
-     * 
-     * <p>This ensures that high-task-count connectors are spread evenly across all workers,
-     * preventing hot spots and improving fault tolerance.</p>
      * 
      * <p><b>Example:</b></p>
      * <pre>
-     * Input:  [A-0, A-1, A-2, A-3, B-0, B-1, C-0, C-1, C-2, C-3]
-     * Output: [A-0, B-0, C-0, A-1, B-1, C-1, A-2, C-2, A-3, C-3]
+     * Before: Worker1 has [A-0, A-1, A-2], Worker2 has [B-0], Worker3 has []
+     * Assigning: [A-3, A-4, B-1, B-2]
+     * 
+     * A-3 -> Worker3 (0 A tasks) instead of Worker1 (3 A tasks)
+     * A-4 -> Worker2 (0 A tasks) instead of Worker1 (3 A tasks)
+     * B-1 -> Worker1 (0 B tasks) instead of Worker2 (1 B task)
+     * B-2 -> Worker3 (0 B tasks) instead of Worker2 (1 B task)
+     * 
+     * Result: Even distribution of A and B tasks across all workers
      * </pre>
+     * 
+     * <p>This connector-aware approach ensures that:</p>
+     * <ul>
+     *   <li>High-task-count connectors spread evenly across all workers</li>
+     *   <li>No worker becomes a hotspot for any single connector</li>
+     *   <li>Load balancing considers both per-connector and overall distribution</li>
+     * </ul>
      *
-     * @param tasks the tasks to be interleaved
-     * @return a list of tasks interleaved by connector to promote even distribution
-     */
-    protected List<ConnectorTaskId> interleaveTasksByConnector(Collection<ConnectorTaskId> tasks) {
-        if (tasks.isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        // Group tasks by connector name, preserving task order within each connector
-        Map<String, List<ConnectorTaskId>> tasksByConnector = new HashMap<>();
-        for (ConnectorTaskId task : tasks) {
-            tasksByConnector.computeIfAbsent(task.connector(), k -> new ArrayList<>()).add(task);
-        }
-
-        // Sort connector names for deterministic assignment across rebalances
-        List<String> sortedConnectors = new ArrayList<>(tasksByConnector.keySet());
-        Collections.sort(sortedConnectors);
-
-        // Create iterators for each connector's task list
-        Map<String, Iterator<ConnectorTaskId>> iterators = new HashMap<>();
-        for (String connector : sortedConnectors) {
-            iterators.put(connector, tasksByConnector.get(connector).iterator());
-        }
-
-        // Interleave tasks using round-robin across connectors
-        List<ConnectorTaskId> interleavedTasks = new ArrayList<>(tasks.size());
-        boolean hasMore = true;
-        while (hasMore) {
-            hasMore = false;
-            for (String connector : sortedConnectors) {
-                Iterator<ConnectorTaskId> it = iterators.get(connector);
-                if (it.hasNext()) {
-                    interleavedTasks.add(it.next());
-                    hasMore = true;
-                }
-            }
-        }
-
-        log.warn("BalancedCooperativeAssignor - Interleaved {} tasks from {} connectors for balanced distribution",
-                interleavedTasks.size(), sortedConnectors.size());
-        return interleavedTasks;
-    }
-
-    /**
-     * Performs task assignment using interleaved distribution to prevent clustering.
-     * 
-     * <p>This method overrides the parent implementation to apply interleaving before
-     * the round-robin assignment, ensuring tasks from different connectors are evenly
-     * distributed across workers from the start.</p>
-     * 
      * @param workerAssignment the current worker assignment; assigned tasks are added to this list
      * @param tasks the tasks to be assigned
      */
     @Override
     protected void assignTasks(List<WorkerLoad> workerAssignment, Collection<ConnectorTaskId> tasks) {
-        // Interleave tasks by connector to promote even distribution across workers
-        Collection<ConnectorTaskId> tasksToAssign = interleaveTasksByConnector(tasks);
+        if (tasks.isEmpty() || workerAssignment.isEmpty()) {
+            return;
+        }
+
+        log.warn("BalancedCooperativeAssignor - Assigning {} tasks to {} workers using connector-aware distribution",
+                tasks.size(), workerAssignment.size());
+
+        // Track how many tasks from each connector are currently on each worker
+        // Map: workerName -> (connectorName -> taskCount)
+        Map<String, Map<String, Integer>> workerConnectorTaskCounts = new HashMap<>();
+        for (WorkerLoad worker : workerAssignment) {
+            Map<String, Integer> connectorCounts = new HashMap<>();
+            for (ConnectorTaskId task : worker.tasks()) {
+                connectorCounts.merge(task.connector(), 1, Integer::sum);
+            }
+            workerConnectorTaskCounts.put(worker.worker(), connectorCounts);
+        }
+
+        // Group tasks by connector and sort for deterministic assignment
+        Map<String, List<ConnectorTaskId>> tasksByConnector = new HashMap<>();
+        for (ConnectorTaskId task : tasks) {
+            tasksByConnector.computeIfAbsent(task.connector(), k -> new ArrayList<>()).add(task);
+        }
         
-        log.warn("BalancedCooperativeAssignor - Assigning {} interleaved tasks to {} workers for balanced distribution",
-                tasksToAssign.size(), workerAssignment.size());
-        // Delegate to parent's round-robin assignment logic with interleaved tasks
-        super.assignTasks(workerAssignment, tasksToAssign);
+        // Sort tasks within each connector by task ID for determinism
+        for (List<ConnectorTaskId> connectorTaskList : tasksByConnector.values()) {
+            connectorTaskList.sort((t1, t2) -> Integer.compare(t1.task(), t2.task()));
+        }
+        
+        List<String> sortedConnectors = new ArrayList<>(tasksByConnector.keySet());
+        Collections.sort(sortedConnectors);
+
+        // Process connectors in sorted order for determinism
+        for (String connector : sortedConnectors) {
+            List<ConnectorTaskId> connectorTasks = tasksByConnector.get(connector);
+            
+            log.warn("BalancedCooperativeAssignor - Assigning {} tasks from connector '{}' using connector-aware selection",
+                    connectorTasks.size(), connector);
+
+            // For each task of this connector, find the best worker
+            for (ConnectorTaskId task : connectorTasks) {
+                WorkerLoad bestWorker = findBestWorkerForTask(
+                        workerAssignment, 
+                        task.connector(), 
+                        workerConnectorTaskCounts
+                );
+
+                // Assign the task to the best worker
+                bestWorker.assign(task);
+
+                // Update the tracking map
+                workerConnectorTaskCounts.get(bestWorker.worker())
+                        .merge(task.connector(), 1, Integer::sum);
+
+                log.debug("BalancedCooperativeAssignor - Assigned task {} to worker {} " +
+                        "(connector task count: {}, total tasks: {})",
+                        task, bestWorker.worker(),
+                        workerConnectorTaskCounts.get(bestWorker.worker()).get(task.connector()),
+                        bestWorker.tasksSize());
+            }
+        }
+
+        log.warn("BalancedCooperativeAssignor - Completed connector-aware task assignment. " +
+                "Final worker loads: {}", workerAssignment.stream()
+                .map(w -> w.worker() + "=" + w.tasksSize())
+                .collect(Collectors.joining(", ")));
+    }
+
+    /**
+     * Finds the best worker to assign a task from a specific connector.
+     * 
+     * <p>Selection criteria (in priority order):</p>
+     * <ol>
+     *   <li>Worker with fewest tasks from this connector (prevents clustering)</li>
+     *   <li>Among those tied, worker with fewest total tasks (load balancing)</li>
+     *   <li>Among those still tied, pick deterministically by worker name (stability)</li>
+     * </ol>
+     * 
+     * @param workers the list of workers to choose from
+     * @param connector the connector name for the task being assigned
+     * @param workerConnectorTaskCounts current per-worker per-connector task counts
+     * @return the best worker to assign the task to
+     */
+    private WorkerLoad findBestWorkerForTask(
+            List<WorkerLoad> workers,
+            String connector,
+            Map<String, Map<String, Integer>> workerConnectorTaskCounts
+    ) {
+        WorkerLoad bestWorker = null;
+        int minConnectorTasks = Integer.MAX_VALUE;
+        int minTotalTasks = Integer.MAX_VALUE;
+
+        for (WorkerLoad worker : workers) {
+            int connectorTaskCount = workerConnectorTaskCounts.get(worker.worker())
+                    .getOrDefault(connector, 0);
+            int totalTaskCount = worker.tasksSize();
+
+            // Compare by connector task count first (primary criterion)
+            if (connectorTaskCount < minConnectorTasks) {
+                bestWorker = worker;
+                minConnectorTasks = connectorTaskCount;
+                minTotalTasks = totalTaskCount;
+            } else if (connectorTaskCount == minConnectorTasks) {
+                // If tied on connector tasks, compare by total tasks (secondary criterion)
+                if (totalTaskCount < minTotalTasks) {
+                    bestWorker = worker;
+                    minTotalTasks = totalTaskCount;
+                } else if (totalTaskCount == minTotalTasks) {
+                    // If still tied, pick deterministically by worker name (tertiary criterion)
+                    if (bestWorker == null || worker.worker().compareTo(bestWorker.worker()) < 0) {
+                        bestWorker = worker;
+                    }
+                }
+            }
+        }
+
+        return bestWorker;
     }
 
     /**
@@ -368,10 +304,19 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
                 WorkerLoad::connectors
         );
 
+        // Calculate cluster-wide connector task counts for balanced revocation
+        Map<String, Integer> clusterConnectorTaskCounts = new HashMap<>();
+        for (WorkerLoad worker : workers) {
+            for (ConnectorTaskId task : worker.tasks()) {
+                clusterConnectorTaskCounts.merge(task.connector(), 1, Integer::sum);
+            }
+        }
+
         // For tasks, use interleaved revocation selection to maintain balanced distribution
         Map<String, Set<ConnectorTaskId>> taskRevocations = interleavedLoadBalancingRevocations(
                 configured.tasks().size(),
-                workers
+                workers,
+                clusterConnectorTaskCounts
         );
 
         connectorRevocations.forEach((worker, revoked) ->
@@ -411,11 +356,13 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
      * 
      * @param totalToAllocate the total number of tasks to allocate across all workers
      * @param workers the collection of workers with their current task assignments
+     * @param clusterConnectorTaskCounts cluster-wide task counts per connector for balanced revocation
      * @return a map of worker IDs to sets of tasks that should be revoked from each worker
      */
     protected Map<String, Set<ConnectorTaskId>> interleavedLoadBalancingRevocations(
             int totalToAllocate,
-            Collection<WorkerLoad> workers
+            Collection<WorkerLoad> workers,
+            Map<String, Integer> clusterConnectorTaskCounts
     ) {
         int totalWorkers = workers.size();
         // The minimum tasks that should be assigned to each worker
@@ -472,10 +419,12 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
             // Calculate how many tasks to revoke from this worker
             int numToRevoke = currentTaskCount - maxAllocationForWorker;
             
-            // Select tasks to revoke in an interleaved manner
+            // Select tasks to revoke in an interleaved manner with balanced allocation for high-volume connectors
             Set<ConnectorTaskId> revokedFromWorker = selectInterleavedTasksToRevoke(
                     worker.tasks(), 
-                    numToRevoke
+                    numToRevoke,
+                    totalWorkers,
+                    clusterConnectorTaskCounts
             );
             
             if (!revokedFromWorker.isEmpty()) {
@@ -489,19 +438,50 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
     }
 
     /**
-     * Selects tasks to revoke from a worker in an interleaved manner across connectors.
+     * Selects tasks to revoke from a worker using a two-tier strategy:
      * 
-     * <p>This ensures that revocations are spread across different connectors rather than
-     * taking all tasks from the same connector, which maintains balanced distribution
-     * even during rebalancing events.</p>
+     * <p><b>Tier 1: High-Volume Connectors</b> - For connectors with task count > worker count,
+     * applies balanced allocation math to determine how many tasks this worker should keep,
+     * ensuring proportional revocations.</p>
+     * 
+     * <p><b>Tier 2: Round-Robin</b> - For remaining tasks or connectors with task count <= worker count,
+     * uses round-robin selection across connectors to maintain balanced distribution.</p>
+     * 
+     * <p><b>Example:</b></p>
+     * <pre>
+     * Cluster: 6 workers
+     * Worker has: [Connector-A: 4 tasks, Connector-B: 2 tasks, Connector-C: 1 task]
+     * Connector-A cluster-wide: 10 tasks (high-volume)
+     * Connector-B cluster-wide: 4 tasks (low-volume)
+     * Connector-C cluster-wide: 2 tasks (low-volume)
+     * Need to revoke: 3 tasks
+     * 
+     * Tier 1 (High-Volume - Connector-A with 10 tasks):
+     *   minPerWorker = 10 / 6 = 1
+     *   workersWithExtra = 10 % 6 = 4
+     *   This worker currently has 4 A-tasks, should keep max 2 (1 + 1 extra)
+     *   Target revocations from A: 4 - 2 = 2 tasks
+     *   Revoke: [A-0, A-1] (2 tasks)
+     * 
+     * Tier 2 (Round-Robin for remaining 1 task):
+     *   Round-robin through B, C
+     *   Revoke: [B-0] (1 task)
+     * 
+     * Final revocations: [A-0, A-1, B-0]
+     * Result: High-volume connector balanced first, then even distribution
+     * </pre>
      * 
      * @param workerTasks the current tasks assigned to the worker
      * @param numToRevoke the number of tasks that need to be revoked
-     * @return a set of tasks selected for revocation in an interleaved manner
+     * @param totalWorkers the total number of workers in the cluster
+     * @param clusterConnectorTaskCounts cluster-wide task counts per connector
+     * @return a set of tasks selected for revocation using the two-tier strategy
      */
     protected Set<ConnectorTaskId> selectInterleavedTasksToRevoke(
             Collection<ConnectorTaskId> workerTasks,
-            int numToRevoke
+            int numToRevoke,
+            int totalWorkers,
+            Map<String, Integer> clusterConnectorTaskCounts
     ) {
         if (numToRevoke <= 0 || workerTasks.isEmpty()) {
             return Collections.emptySet();
@@ -513,18 +493,191 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
             tasksByConnector.computeIfAbsent(task.connector(), k -> new ArrayList<>()).add(task);
         }
 
-        // Sort connector names for deterministic selection
-        List<String> sortedConnectors = new ArrayList<>(tasksByConnector.keySet());
-        Collections.sort(sortedConnectors);
+        Set<ConnectorTaskId> tasksToRevoke = new LinkedHashSet<>();
 
-        // Create iterators for each connector's task list
-        Map<String, Iterator<ConnectorTaskId>> iterators = new HashMap<>();
-        for (String connector : sortedConnectors) {
-            iterators.put(connector, tasksByConnector.get(connector).iterator());
+        // TIER 1: Handle high-volume connectors first
+        revokeFromHighVolumeConnectors(
+                tasksToRevoke, 
+                tasksByConnector, 
+                numToRevoke, 
+                totalWorkers, 
+                clusterConnectorTaskCounts
+        );
+
+        // TIER 2: If we still need to revoke more, use round-robin
+        if (tasksToRevoke.size() < numToRevoke) {
+            revokeRoundRobin(tasksToRevoke, tasksByConnector, numToRevoke);
         }
 
-        // Select tasks in round-robin fashion across connectors
-        Set<ConnectorTaskId> tasksToRevoke = new LinkedHashSet<>();
+        log.debug("BalancedCooperativeAssignor - Final revocation selection: {} tasks from connectors: {}",
+                tasksToRevoke.size(),
+                tasksToRevoke.stream()
+                        .collect(Collectors.groupingBy(ConnectorTaskId::connector, Collectors.counting())));
+
+        return tasksToRevoke;
+    }
+
+    /**
+     * Revokes tasks from high-volume connectors (task count > worker count) using balanced allocation math.
+     */
+    private void revokeFromHighVolumeConnectors(
+            Set<ConnectorTaskId> tasksToRevoke,
+            Map<String, List<ConnectorTaskId>> tasksByConnector,
+            int numToRevoke,
+            int totalWorkers,
+            Map<String, Integer> clusterConnectorTaskCounts
+    ) {
+        List<String> highVolumeConnectors = identifyHighVolumeConnectors(
+                tasksByConnector, 
+                totalWorkers, 
+                clusterConnectorTaskCounts
+        );
+
+        log.debug("BalancedCooperativeAssignor - High-volume connectors (task count > workers): {}",
+                highVolumeConnectors.stream()
+                        .map(c -> c + "(" + clusterConnectorTaskCounts.get(c) + " tasks)")
+                        .collect(Collectors.joining(", ")));
+
+        // Apply balanced allocation math to high-volume connectors
+        for (String connector : highVolumeConnectors) {
+            if (tasksToRevoke.size() >= numToRevoke) {
+                break;
+            }
+
+            List<ConnectorTaskId> connectorTasks = tasksByConnector.get(connector);
+            int workerCurrentCount = connectorTasks.size();
+            int clusterTaskCount = clusterConnectorTaskCounts.get(connector);
+
+            int maxToKeep = calculateMaxTasksToKeep(clusterTaskCount, totalWorkers);
+
+            // If this worker is overloaded for this connector, revoke excess
+            if (workerCurrentCount > maxToKeep) {
+                int toRevokeFromConnector = Math.min(
+                        workerCurrentCount - maxToKeep,
+                        numToRevoke - tasksToRevoke.size()
+                );
+
+                log.debug("BalancedCooperativeAssignor - Connector {} (high-volume): cluster={}, worker={}, " +
+                        "maxToKeep={}, revoking={} tasks",
+                        connector, clusterTaskCount, workerCurrentCount, maxToKeep, toRevokeFromConnector);
+
+                // Revoke the first N tasks from this connector
+                for (int i = 0; i < toRevokeFromConnector && i < connectorTasks.size(); i++) {
+                    tasksToRevoke.add(connectorTasks.get(i));
+                }
+            }
+        }
+    }
+
+    /**
+     * Identifies high-volume connectors (task count > worker count) and sorts them deterministically.
+     */
+    private List<String> identifyHighVolumeConnectors(
+            Map<String, List<ConnectorTaskId>> tasksByConnector,
+            int totalWorkers,
+            Map<String, Integer> clusterConnectorTaskCounts
+    ) {
+        List<String> highVolumeConnectors = new ArrayList<>();
+        for (String connector : tasksByConnector.keySet()) {
+            int clusterTaskCount = clusterConnectorTaskCounts.getOrDefault(connector, 0);
+            if (clusterTaskCount > totalWorkers) {
+                highVolumeConnectors.add(connector);
+            }
+        }
+
+        // Sort by cluster task count descending for determinism
+        highVolumeConnectors.sort((c1, c2) -> {
+            int count1 = clusterConnectorTaskCounts.get(c1);
+            int count2 = clusterConnectorTaskCounts.get(c2);
+            int countCompare = Integer.compare(count2, count1);
+            if (countCompare != 0) {
+                return countCompare;
+            }
+            return c1.compareTo(c2);
+        });
+
+        return highVolumeConnectors;
+    }
+
+    /**
+     * Calculates the maximum number of tasks a worker should keep for a connector
+     * based on balanced allocation math.
+     */
+    private int calculateMaxTasksToKeep(int clusterTaskCount, int totalWorkers) {
+        int minAllocatedPerWorkerForConnector = clusterTaskCount / totalWorkers;
+        int workersToAllocateExtra = clusterTaskCount % totalWorkers;
+        
+        // This worker should keep at most: min + (possibly 1 extra)
+        return workersToAllocateExtra > 0 
+                ? minAllocatedPerWorkerForConnector + 1 
+                : minAllocatedPerWorkerForConnector;
+    }
+
+    /**
+     * Revokes remaining tasks using round-robin selection across connectors.
+     */
+    private void revokeRoundRobin(
+            Set<ConnectorTaskId> tasksToRevoke,
+            Map<String, List<ConnectorTaskId>> tasksByConnector,
+            int numToRevoke
+    ) {
+        log.debug("BalancedCooperativeAssignor - After high-volume revocations: {}/{} tasks revoked. " +
+                "Using round-robin for remaining {} tasks",
+                tasksToRevoke.size(), numToRevoke, numToRevoke - tasksToRevoke.size());
+
+        // Build list of connectors sorted by task count (descending), then alphabetically
+        List<String> sortedConnectors = new ArrayList<>(tasksByConnector.keySet());
+        sortedConnectors.sort((c1, c2) -> {
+            int count1 = tasksByConnector.get(c1).size();
+            int count2 = tasksByConnector.get(c2).size();
+            int countCompare = Integer.compare(count2, count1);
+            if (countCompare != 0) {
+                return countCompare;
+            }
+            return c1.compareTo(c2);
+        });
+
+        // Create iterators, skipping already-revoked tasks
+        Map<String, Iterator<ConnectorTaskId>> iterators = createIteratorsSkippingRevoked(
+                tasksByConnector, 
+                tasksToRevoke
+        );
+
+        // Select tasks in round-robin fashion
+        selectTasksRoundRobin(tasksToRevoke, sortedConnectors, iterators, numToRevoke);
+    }
+
+    /**
+     * Creates iterators for connectors, skipping tasks that are already marked for revocation.
+     */
+    private Map<String, Iterator<ConnectorTaskId>> createIteratorsSkippingRevoked(
+            Map<String, List<ConnectorTaskId>> tasksByConnector,
+            Set<ConnectorTaskId> tasksToRevoke
+    ) {
+        Map<String, Iterator<ConnectorTaskId>> iterators = new HashMap<>();
+        for (Map.Entry<String, List<ConnectorTaskId>> entry : tasksByConnector.entrySet()) {
+            List<ConnectorTaskId> availableTasks = new ArrayList<>();
+            for (ConnectorTaskId task : entry.getValue()) {
+                if (!tasksToRevoke.contains(task)) {
+                    availableTasks.add(task);
+                }
+            }
+            if (!availableTasks.isEmpty()) {
+                iterators.put(entry.getKey(), availableTasks.iterator());
+            }
+        }
+        return iterators;
+    }
+
+    /**
+     * Selects tasks in round-robin fashion from the iterators until target is reached.
+     */
+    private void selectTasksRoundRobin(
+            Set<ConnectorTaskId> tasksToRevoke,
+            List<String> sortedConnectors,
+            Map<String, Iterator<ConnectorTaskId>> iterators,
+            int numToRevoke
+    ) {
         while (tasksToRevoke.size() < numToRevoke) {
             boolean addedAny = false;
             for (String connector : sortedConnectors) {
@@ -532,18 +685,15 @@ public class BalancedCooperativeAssignor extends IncrementalCooperativeAssignor 
                     break;
                 }
                 Iterator<ConnectorTaskId> it = iterators.get(connector);
-                if (it.hasNext()) {
+                if (it != null && it.hasNext()) {
                     tasksToRevoke.add(it.next());
                     addedAny = true;
                 }
             }
-            // If we couldn't add any tasks in this round, break to avoid infinite loop
             if (!addedAny) {
                 break;
             }
         }
-
-        return tasksToRevoke;
     }
 
     /**

@@ -182,18 +182,6 @@ public class DistributedConfig extends WorkerConfig {
             + "period the connectors and tasks of the departed workers remain unassigned";
     public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));
 
-    /**
-     * <code>worker.join.delay.ms</code>
-     */
-    public static final String WORKER_JOIN_DELAY_MS_CONFIG = "worker.join.delay.ms";
-    public static final String WORKER_JOIN_DELAY_MS_DOC = "The delay in milliseconds to wait for additional workers "
-            + "to join the cluster before triggering task rebalancing and assignment. This is particularly useful in "
-            + "environments with spot instances or autoscaling where multiple workers may join in quick succession. "
-            + "By delaying the rebalance, the cluster can avoid multiple consecutive rebalances and achieve a more "
-            + "stable assignment. This delay only applies when new workers join; it does not affect rebalances triggered "
-            + "by workers leaving the cluster. A value of 0 means rebalance immediately when any worker joins (default behavior).";
-    public static final int WORKER_JOIN_DELAY_MS_DEFAULT = 0;
-
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys. "
@@ -493,12 +481,6 @@ public class DistributedConfig extends WorkerConfig {
                     between(0, Integer.MAX_VALUE),
                     ConfigDef.Importance.LOW,
                     SCHEDULED_REBALANCE_MAX_DELAY_MS_DOC)
-            .define(WORKER_JOIN_DELAY_MS_CONFIG,
-                    ConfigDef.Type.INT,
-                    WORKER_JOIN_DELAY_MS_DEFAULT,
-                    between(0, Integer.MAX_VALUE),
-                    ConfigDef.Importance.LOW,
-                    WORKER_JOIN_DELAY_MS_DOC)
             .define(INTER_WORKER_KEY_TTL_MS_CONFIG,
                     ConfigDef.Type.INT,
                     INTER_WORKER_KEY_TTL_MS_MS_DEFAULT,

@@ -127,10 +127,9 @@ public class WorkerGroupMember {
 
             // Create the appropriate assignor based on configuration
             int maxDelay = config.getInt(DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_CONFIG);
-            int workerJoinDelayMs = config.getInt(DistributedConfig.WORKER_JOIN_DELAY_MS_CONFIG);
             ConnectAssignor assignor;
             if (config.isBalancedCooperativeAssignorEnabled()) {
-                assignor = new BalancedCooperativeAssignor(logContext, time, maxDelay, workerJoinDelayMs);
+                assignor = new BalancedCooperativeAssignor(logContext, time, maxDelay);
             } else {
                 assignor = new IncrementalCooperativeAssignor(logContext, time, maxDelay);
             }
